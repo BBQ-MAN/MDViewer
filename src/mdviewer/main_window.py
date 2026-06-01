@@ -531,6 +531,7 @@ class MainWindow(QMainWindow):
             "MDViewer 정보",
             f"<h3>MDViewer {__version__}</h3>"
             "<p>Python/PySide6 기반 마크다운 뷰어.</p>"
+            "<p>만든이 : One &amp; Wise for YONI</p>"
             f"<p style='color:gray;font-size:0.9em'>코어 엔진: {core}</p>"
             "<p style='color:gray;font-size:0.85em'>"
             "단축키: Ctrl+O 열기 · Ctrl+R 새로고침 · Ctrl+T 테마 · "
