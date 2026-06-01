@@ -1,0 +1,39 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.installed.cfg
+
+# ---- 가상환경 ----
+.venv/
+venv/
+env/
+
+# ---- PyInstaller 빌드 산출물 (대용량 — 커밋 금지) ----
+build/
+dist/
+*.manifest
+
+# ---- 테스트/캐시 ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- 임시/프로브 산출물 ----
+_probe*.py
+_probe*.spec
+_verify_*.py
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 에디터/로컬 설정 ----
+.vscode/
+.idea/
+.claude/settings.local.json

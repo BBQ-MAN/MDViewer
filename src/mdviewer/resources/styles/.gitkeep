@@ -1,0 +1,7 @@
+# 이 디렉터리는 ui-dev 가 채운다.
+# 예정 파일:
+#   github.css   — 라이트 테마 본문 스타일
+#   dark.css     — 다크 테마 본문 스타일
+#   pygments-light.css / pygments-dark.css — 코드 하이라이트 테마 (Pygments 생성)
+#
+# 모든 스타일 로드는 mdviewer.paths.styles_dir() 를 거친다 (번들 경로 안전성).

@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mdviewer"
+version = "0.1.0"
+description = "Python/PySide6 기반 Windows 데스크톱 마크다운 뷰어"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Lectus", email = "support@lectus.kr" }]
+keywords = ["markdown", "viewer", "pyside6", "desktop", "qt"]
+
+dependencies = [
+    "PySide6>=6.8,<6.10",
+    "markdown-it-py>=3.0",
+    "mdit-py-plugins>=0.4",
+    "Pygments>=2.17",
+    "watchdog>=4.0",
+    "charset-normalizer>=3.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pyinstaller>=6.6",
+]
+
+[project.gui-scripts]
+# 콘솔 창 없이 실행되는 GUI 진입점 (Windows)
+mdviewer = "mdviewer.app:main"
+
+[project.scripts]
+# 콘솔 진입점 (디버깅/로그 확인용)
+mdviewer-cli = "mdviewer.app:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# 리소스(CSS/아이콘)를 패키지에 동봉한다.
+mdviewer = ["resources/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
