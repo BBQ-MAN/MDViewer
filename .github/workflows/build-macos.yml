@@ -13,16 +13,16 @@ jobs:
   build:
     runs-on: macos-14       # Apple Silicon(arm64) 러너. Intel 빌드는 macos-13 사용.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"   # PySide6 6.8+ 안정 조합
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt pyinstaller
+          python -m pip install -r requirements.txt pyinstaller pytest   # pytest 는 테스트 전용(런타임 deps 아님)
 
       - name: Run core unit tests
         run: PYTHONPATH=src python -m pytest tests -q

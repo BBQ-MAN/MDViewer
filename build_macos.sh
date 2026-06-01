@@ -29,9 +29,9 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt pyinstaller
+python -m pip install -r requirements.txt pyinstaller pytest
 
-# 2) (선택) 단위 테스트 — 코어는 GUI 무의존이라 맥에서도 그대로 통과해야 함
+# 2) 단위 테스트 — 코어는 GUI 무의존이라 맥에서도 그대로 통과해야 함
 if python -c "import pytest" 2>/dev/null; then
   echo "==> 단위 테스트"
   PYTHONPATH=src python -m pytest tests -q || { echo "테스트 실패 — 빌드 중단"; exit 1; }
