@@ -6,8 +6,15 @@
 코어 호출 지점:
     - read_markdown(path)            : 파일 읽기(인코딩 자동 감지)
     - render(text, base_dir=...)     : 마크다운 → 본문 HTML + TOC
+    - html_to_markdown(html)         : 클립보드 HTML → 마크다운 소스(항상 str, 예외 비전파)
+    - write_markdown(path, text)     : 마크다운 소스 → 파일 저장(OSError 전파)
     - FileWatcher(on_changed=...)    : 외부 변경 감시(워커 스레드 콜백)
 코어가 아직 없을 수 있으므로 import 는 graceful 하게 처리한다(병렬 개발).
+
+문서 모델(Phase 6):
+    - _doc_text : 현재 표시 중인 마크다운 소스(항상 최신). 렌더 입력원.
+    - _path     : 연결된 파일(None = scratch, 미저장 임시 문서).
+    - _dirty    : 마지막 저장 이후 변경 여부(타이틀 미저장 표시).
 """
 
 from __future__ import annotations
@@ -34,7 +41,12 @@ from .settings import Settings
 
 # ---- 코어 엔진(병렬 개발) — 없으면 graceful degradation --------------------
 try:  # pragma: no cover - 통합 시점에 따라 분기
-    from .renderer import read_markdown, render  # type: ignore
+    from .renderer import (  # type: ignore
+        html_to_markdown,
+        read_markdown,
+        render,
+        write_markdown,
+    )
     _CORE_AVAILABLE = True
     _CORE_IMPORT_ERROR = ""
 except Exception as exc:  # ImportError 또는 의존성 누락
@@ -65,6 +77,20 @@ except Exception as exc:  # ImportError 또는 의존성 누락
         )
         return _Result(body)
 
+    def html_to_markdown(html: str) -> str:  # type: ignore
+        """코어 미존재 시 폴백: 태그 제거 평문(크래시 금지, 항상 str)."""
+        import re
+        from html import unescape
+
+        return unescape(re.sub(r"<[^>]+>", "", html or "")).strip()
+
+    def write_markdown(path: Path, text: str) -> None:  # type: ignore
+        """코어 미존재 시 폴백: UTF-8(BOM 없음)·개행 보존 쓰기(OSError 전파)."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            f.write(text or "")
+
 try:  # FileWatcher 도 별도 graceful 처리.
     from .file_watcher import FileWatcher  # type: ignore
     _WATCHER_AVAILABLE = True
@@ -89,7 +115,10 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.settings = Settings()
-        self._path: Path | None = None
+        # ---- 문서 모델(Phase 6) ----
+        self._doc_text: str = ""          # 현재 표시 중인 마크다운 소스(렌더 입력원)
+        self._path: Path | None = None    # 연결된 파일(None = scratch 임시 문서)
+        self._dirty: bool = False         # 마지막 저장 이후 변경 여부
         self._theme = self.settings.theme()
         self._zoom = self.settings.zoom()
         self._pending_scroll: tuple[float, float] | None = None
@@ -133,7 +162,10 @@ class MainWindow(QMainWindow):
         self._reload_timer = QTimer(self)
         self._reload_timer.setSingleShot(True)
         self._reload_timer.setInterval(_RELOAD_DEBOUNCE_MS)
-        self._reload_timer.timeout.connect(self._reload_current)
+        # 외부 변경(watch)은 디스크 파일이 있을 때만 발생 → 디스크 재독, 스크롤 보존.
+        self._reload_timer.timeout.connect(
+            lambda: self._load_from_disk(preserve_scroll=True)
+        )
         self._watcher = None
         if _WATCHER_AVAILABLE:
             try:
@@ -187,7 +219,19 @@ class MainWindow(QMainWindow):
 
         self.act_reload = QAction("새로고침", self)
         self.act_reload.setShortcut(QKeySequence("Ctrl+R"))
-        self.act_reload.triggered.connect(self._reload_current)
+        self.act_reload.triggered.connect(self.reload_current)
+
+        self.act_paste = QAction("클립보드를 마크다운으로 붙여넣기", self)
+        self.act_paste.setShortcut(QKeySequence("Ctrl+Shift+V"))
+        self.act_paste.triggered.connect(self.paste_clipboard)
+
+        self.act_save = QAction("저장", self)
+        self.act_save.setShortcut(QKeySequence.StandardKey.Save)  # Ctrl+S
+        self.act_save.triggered.connect(self.save)
+
+        self.act_save_as = QAction("다른 이름으로 저장...", self)
+        self.act_save_as.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.act_save_as.triggered.connect(self.save_as)
 
         self.act_exit = QAction("종료", self)
         self.act_exit.setShortcut(QKeySequence.StandardKey.Quit)
@@ -238,6 +282,11 @@ class MainWindow(QMainWindow):
         m_file = mb.addMenu("파일(&F)")
         m_file.addAction(self.act_open)
         self.menu_recent = m_file.addMenu("최근 파일(&R)")
+        m_file.addSeparator()
+        m_file.addAction(self.act_paste)
+        m_file.addAction(self.act_save)
+        m_file.addAction(self.act_save_as)
+        m_file.addSeparator()
         m_file.addAction(self.act_reload)
         m_file.addSeparator()
         m_file.addAction(self.act_exit)
@@ -261,6 +310,9 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         tb.addAction(self.act_open)
         tb.addAction(self.act_reload)
+        tb.addSeparator()
+        tb.addAction(self.act_paste)
+        tb.addAction(self.act_save)
         tb.addSeparator()
         tb.addAction(self.act_zoom_out)
         tb.addAction(self.act_zoom_reset)
@@ -316,24 +368,18 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "열 수 없음", f"파일이 아닙니다:\n{path}")
             return
 
+        # 미저장 변경 가드(scratch/편집 후 다른 파일 열기 시 데이터 유실 방지).
+        if not self._maybe_discard():
+            return
+
         self._path = path
         self._pending_scroll = None  # 새 문서는 상단부터
-        ok = self._reload_current(preserve_scroll=False)
+        ok = self._load_from_disk(preserve_scroll=False)
         if not ok:
             return
 
-        # 감시 등록
-        if self._watcher is not None:
-            try:
-                self._watcher.watch(path)
-            except Exception:
-                pass
-
-        # 최근 파일 + 타이틀
-        self.settings.add_recent_file(str(path))
-        self._refresh_recent_menu()
-        self.setWindowTitle(f"{path.name} — MDViewer")
-        self.statusBar().showMessage(str(path))
+        # 디스크 파일에 연결: 감시 등록 + 최근 추가 + 타이틀(_dirty=False).
+        self._attach_path(path)
 
     def _drop_from_recent(self, path: Path) -> None:
         p = str(Path(path).resolve())
@@ -358,14 +404,173 @@ class MainWindow(QMainWindow):
         event.ignore()
 
     # ------------------------------------------------------------------ #
-    # 렌더링
+    # 문서 모델 — dirty/타이틀, scratch ↔ 파일 전환, watch 생명주기
     # ------------------------------------------------------------------ #
-    def _reload_current(self, preserve_scroll: bool = True) -> bool:
-        """현재 파일을 다시 읽어 렌더한다. 성공 시 True."""
+    def _set_dirty(self, dirty: bool) -> None:
+        self._dirty = dirty
+        self._update_title()
+
+    def _update_title(self) -> None:
+        name = self._path.name if self._path is not None else "제목 없음"
+        mark = "•" if self._dirty else ""
+        self.setWindowTitle(f"{mark}{name} — MDViewer")
+
+    def _scratch_base_dir(self) -> Path:
+        """scratch 문서의 상대경로 해석 기준 폴더.
+
+        최근 파일의 부모가 있으면 사용, 없으면 현재 작업 디렉터리.
+        """
+        recents = self.settings.recent_files()
+        if recents:
+            try:
+                parent = Path(recents[0]).parent
+                if parent.exists():
+                    return parent
+            except Exception:
+                pass
+        return Path.cwd()
+
+    def _suggest_name(self) -> Path:
+        """scratch 저장 시 제안할 기본 파일 경로(_scratch_base_dir/제목 없음.md)."""
+        return self._scratch_base_dir() / "제목 없음.md"
+
+    def _set_scratch(self, text: str) -> None:
+        """현재 문서를 경로 없는 scratch(미저장 임시 문서)로 전환.
+
+        watch 중지(디스크 파일 없음) → _path=None → _doc_text 설정 → 즉시 렌더
+        → _dirty=True(저장 유도). watch 생명주기 규칙: scratch 전환 = stop.
+        """
+        if self._watcher is not None:
+            try:
+                self._watcher.stop()
+            except Exception:
+                pass
+        self._path = None
+        self._doc_text = text
+        self._pending_scroll = None  # 새 문서는 상단부터
+        self._render_doc(preserve_scroll=False)
+        self._set_dirty(True)
+        self.statusBar().showMessage("임시 문서(붙여넣기) — 저장하려면 Ctrl+S", 5000)
+
+    def _attach_path(self, path: Path) -> None:
+        """문서를 디스크 파일에 연결(열기/저장 성공 후).
+
+        watch 시작(교체) + 최근 파일 추가 + 타이틀 갱신 + _dirty=False.
+        watch 생명주기 규칙: 열기/저장성공 = watch(new_path).
+        """
+        self._path = Path(path)
+        if self._watcher is not None:
+            try:
+                self._watcher.watch(self._path)
+            except Exception:
+                pass
+        self.settings.add_recent_file(str(self._path))
+        self._refresh_recent_menu()
+        self._set_dirty(False)
+        self.statusBar().showMessage(str(self._path))
+
+    # ------------------------------------------------------------------ #
+    # 붙여넣기 — 클립보드(HTML 우선 / plain 폴백) → scratch 문서
+    # ------------------------------------------------------------------ #
+    def paste_clipboard(self) -> None:
+        """Ctrl+Shift+V: 클립보드 내용을 마크다운으로 변환해 scratch 문서로 표시.
+
+        HTML 이 있으면 html_to_markdown(core, 항상 str). 변환 결과가 비면 plain
+        text 폴백. 둘 다 없으면 현재 문서를 유지하고 안내만 한다.
+        """
+        cb = QGuiApplication.clipboard()
+        md = cb.mimeData()
+        text = ""
+        if md.hasHtml():
+            text = html_to_markdown(md.html())  # core 호출(예외 비전파, str)
+            if not text.strip() and md.hasText():
+                text = md.text()  # HTML 변환이 비면 plain 폴백
+        elif md.hasText():
+            text = md.text()  # plain text 를 그대로 마크다운으로 취급
+        else:
+            self.statusBar().showMessage("클립보드에 붙여넣을 텍스트가 없습니다.", 3000)
+            return
+
+        if not text.strip():
+            self.statusBar().showMessage("클립보드 내용이 비어 있습니다.", 3000)
+            return
+
+        # 미저장 변경 가드(붙여넣기로 현재 문서를 덮어쓰기 전).
+        if not self._maybe_discard():
+            return
+        self._set_scratch(text)
+
+    # ------------------------------------------------------------------ #
+    # 저장 — Ctrl+S(저장) / Ctrl+Shift+S(다른 이름으로 저장)
+    # ------------------------------------------------------------------ #
+    def save(self) -> bool:
+        """Ctrl+S: scratch 면 Save As, 파일연결이면 같은 경로에 바로 저장."""
+        if self._path is None:
+            return self.save_as()
+        return self._write_to(self._path)
+
+    def save_as(self) -> bool:
+        """Ctrl+Shift+S: 항상 파일 대화상자. *.md 기본, 확장자 없으면 .md 보정."""
+        start = str(self._path) if self._path else str(self._suggest_name())
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "다른 이름으로 저장", start, "Markdown (*.md *.markdown);;모든 파일 (*.*)"
+        )
+        if not path_str:
+            return False  # 사용자 취소
+        path = Path(path_str)
+        if path.suffix == "":
+            path = path.with_suffix(".md")
+        return self._write_to(path)
+
+    def _write_to(self, path: Path) -> bool:
+        """write_markdown(core) 으로 _doc_text 저장. OSError 는 잡아 경고."""
+        path = Path(path)
+        try:
+            write_markdown(path, self._doc_text)  # core 호출(OSError 전파)
+        except OSError as exc:
+            QMessageBox.warning(self, "저장 실패", f"파일을 저장할 수 없습니다:\n{exc}")
+            return False  # dirty 유지, watch/연결 변경 없음
+        was_scratch = self._path is None
+        if self._path != path:
+            # 새 경로(또는 scratch→파일): watch 교체 + recent + 연결 + dirty off.
+            self._attach_path(path)
+        else:
+            self._set_dirty(False)  # 같은 경로 재저장
+        suffix = "  (임시 문서를 파일로 저장)" if was_scratch else ""
+        self.statusBar().showMessage(f"저장됨: {path}{suffix}", 3000)
+        return True
+
+    def _maybe_discard(self) -> bool:
+        """미저장 변경이 있으면 저장/버림/취소 묻기. True=계속 진행 가능."""
+        if not self._dirty:
+            return True
+        btn = QMessageBox.question(
+            self,
+            "저장하지 않은 변경",
+            "변경 내용을 저장하시겠습니까?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+        )
+        if btn == QMessageBox.StandardButton.Save:
+            return self.save()  # 저장 성공 시에만 진행
+        if btn == QMessageBox.StandardButton.Discard:
+            return True
+        return False  # Cancel
+
+    # ------------------------------------------------------------------ #
+    # 렌더링 — 디스크 재독(_load_from_disk) vs 소스 렌더(_render_doc) 분리
+    # ------------------------------------------------------------------ #
+    def _load_from_disk(self, *, preserve_scroll: bool) -> bool:
+        """디스크에서 현재 _path 를 다시 읽어 _doc_text 갱신 후 렌더.
+
+        열기/외부변경/Ctrl+R 전용. scratch(_path is None) 면 디스크 소스가
+        없으므로 아무 것도 하지 않고 False 반환. 성공 시 _dirty=False.
+        """
         if self._path is None:
             return False
         try:
-            text = read_markdown(self._path)
+            self._doc_text = read_markdown(self._path)
         except FileNotFoundError:
             self.statusBar().showMessage(f"파일이 사라졌습니다: {self._path}")
             return False
@@ -373,14 +578,34 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "읽기 오류", f"파일을 읽을 수 없습니다:\n{exc}")
             return False
 
-        result = render(text, base_dir=self._path.parent)  # 예외 안 던짐(계약)
+        self._render_doc(preserve_scroll=preserve_scroll)
+        self._set_dirty(False)  # 디스크와 동기화됨
+        return True
+
+    def _render_doc(self, *, preserve_scroll: bool) -> None:
+        """_doc_text 를 렌더해 화면에 반영(파일 재독 없음).
+
+        base_dir 은 _path 가 있으면 그 부모, scratch 면 _scratch_base_dir().
+        테마 전환·붙여넣기 직후처럼 디스크 재독이 불필요한 경로에서 사용.
+        """
+        base_dir = self._path.parent if self._path else self._scratch_base_dir()
+        result = render(self._doc_text, base_dir=base_dir)  # 예외 안 던짐(계약)
 
         if preserve_scroll:
             # loadFinished 후 복원할 스크롤 위치를 비동기로 캡처.
             self._capture_scroll_then_render(result)
         else:
             self._set_document(result, restore_scroll=False)
-        return True
+
+    def reload_current(self) -> bool:
+        """Ctrl+R: 현재 파일을 디스크에서 다시 읽어 렌더(스크롤 보존).
+
+        scratch 는 디스크 소스가 없어 새로고침 대상이 없다(no-op + 안내).
+        """
+        if self._path is None:
+            self.statusBar().showMessage("임시 문서는 새로고침 대상이 없습니다.", 3000)
+            return False
+        return self._load_from_disk(preserve_scroll=True)
 
     def _capture_scroll_then_render(self, result) -> None:
         """현재 스크롤을 JS 로 읽은 뒤 렌더(외부 변경 시 위치 보존)."""
@@ -403,7 +628,9 @@ class MainWindow(QMainWindow):
         body = getattr(result, "html", "") or ""
         dark = self._theme == theme_mod.DARK
         html = theme_mod.wrap_document(body, dark)
-        base = QUrl.fromLocalFile(str(self._path.parent) + "/") if self._path else QUrl()
+        # scratch 도 base_dir 을 부여해 상대 링크/이미지 해석 기준을 제공.
+        base_dir = self._path.parent if self._path else self._scratch_base_dir()
+        base = QUrl.fromLocalFile(str(base_dir) + "/")
         if not restore_scroll:
             self._pending_scroll = None
         self.view.setHtml(html, base)
@@ -476,9 +703,10 @@ class MainWindow(QMainWindow):
     def toggle_theme(self) -> None:
         self._theme = theme_mod.toggle_theme(self._theme)
         self.settings.set_theme(self._theme)
-        if self._path is not None:
-            # CSS 만 교체 — 스크롤 보존하며 다시 감싸 렌더.
-            self._reload_current(preserve_scroll=True)
+        # 문서가 있으면(파일/scratch 무관) CSS 만 교체해 다시 감싸 렌더(디스크 재독 없음).
+        # 문서가 없으면(초기 상태) 환영 화면만 테마 반영.
+        if self._path is not None or self._doc_text:
+            self._render_doc(preserve_scroll=True)
         else:
             self._show_welcome()
         self.statusBar().showMessage(
@@ -534,7 +762,9 @@ class MainWindow(QMainWindow):
             "<p>만든이 : One &amp; Wise for YONI</p>"
             f"<p style='color:gray;font-size:0.9em'>코어 엔진: {core}</p>"
             "<p style='color:gray;font-size:0.85em'>"
-            "단축키: Ctrl+O 열기 · Ctrl+R 새로고침 · Ctrl+T 테마 · "
+            "단축키: Ctrl+O 열기 · Ctrl+Shift+V 붙여넣기 · "
+            "Ctrl+S 저장 · Ctrl+Shift+S 다른 이름으로 저장 · "
+            "Ctrl+R 새로고침 · Ctrl+T 테마 · "
             "Ctrl+= / Ctrl+- / Ctrl+0 줌 · F11 전체화면 · Ctrl+\\ 목차</p>",
         )
 
@@ -542,6 +772,10 @@ class MainWindow(QMainWindow):
     # 종료 정리
     # ------------------------------------------------------------------ #
     def closeEvent(self, event) -> None:  # noqa: N802
+        # 미저장 변경 가드(데이터 유실 방지) — 취소 시 종료 중단.
+        if not self._maybe_discard():
+            event.ignore()
+            return
         try:
             self.settings.set_geometry(self.saveGeometry())
             self.settings.set_window_state(self.saveState())

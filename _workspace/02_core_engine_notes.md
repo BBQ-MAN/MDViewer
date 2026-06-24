@@ -150,4 +150,75 @@ class FileWatcher:
 ## 8. 패키지 export 확인
 
 `mdviewer.__all__` = `__version__, __app_name__, __author__, render, read_markdown,
-RenderResult, TocItem, pygments_css, FileWatcher` — 재import 정상.
+write_markdown, html_to_markdown, RenderResult, TocItem, pygments_css, FileWatcher` — 재import 정상.
+
+---
+
+## 9. Phase 6 추가 — 클립보드 붙여넣기 / 임시 문서 저장 (core 순수 함수 2개)
+
+> 작성: core-engine-dev · 2026-06-24 · 기준: `_workspace/06_clipboard_feature_design.md` §2 (계약)
+> 대상 독자: ui-dev(호출), QA(단위·round-trip·예외 검증)
+
+### 9.1 위치 / import 경로 (확정)
+
+설계 06 §2·§5 의 **확정 계약대로 `renderer.py` 에 추가**함(별도 `convert.py` 만들지 않음 —
+설계 요약 일부에 `convert.py` 표기가 있었으나 §2/§5 본문이 "renderer.py, read_markdown 과 동거"로
+못박았고, 그것이 권위 문서). 두 함수 모두 패키지 루트에도 export.
+
+```python
+# 권장 (패키지 루트)
+from mdviewer import html_to_markdown, write_markdown
+# 또는 모듈 직접
+from mdviewer.renderer import html_to_markdown, write_markdown
+```
+
+`renderer.__all__` 와 `mdviewer.__all__` 둘 다에 `html_to_markdown`, `write_markdown` 추가됨.
+
+### 9.2 정확한 시그니처
+
+```python
+def html_to_markdown(html: str) -> str
+    # HTML 조각/문서 → Markdown. 라이브러리: html2text.
+    # ★ 항상 str 반환(절대 None 금지). None/공백 입력 → "".
+    # ★ 예외 비전파 — 내부 오류 시 태그 제거 평문으로 복구(크래시 금지).
+    # HTML2Text 인스턴스를 호출마다 새로 생성(전역 공유 안 함 → 상태 누적 방지, thread-safe).
+    # 설정: body_width=0, ignore_images=False, ignore_links=False, ignore_emphasis=False.
+    # 결과는 result.strip("\n") 수준의 가벼운 트림만(과도한 재포맷 안 함).
+
+def write_markdown(path: Path, text: str) -> None
+    # read_markdown 과 대칭. UTF-8(BOM 없음), newline="" 로 열어 개행 그대로 보존.
+    # 부모 디렉터리 없으면 생성(mkdir parents=True, exist_ok=True). text=None → "".
+    # 기존 파일 덮어쓰기(묻지 않음). 
+    # ★ 예외 정책 비대칭: OSError 전파(삼키지 않음). UI 가 try/except 로 잡아 QMessageBox.
+```
+
+### 9.3 예외/반환 정책 대조표 (경계면 버그 방지 — ui-dev 필독)
+
+| 함수 | 입력 오류 | I/O 오류 | None 반환 |
+|------|----------|---------|----------|
+| `render` | 비전파 | n/a | 안 함 |
+| `read_markdown` | 디코딩 실패 복구 | `FileNotFoundError`/`OSError` 전파 | 안 함(str) |
+| `html_to_markdown` | 비전파(`""` 복구) | n/a | 안 함(str) |
+| `write_markdown` | None→"" | **`OSError` 전파** | n/a(None) |
+
+- **A.** `html_to_markdown` 반환은 **항상 str** → UI 는 `.strip()` 안전. 빈/None/공백 입력 → `""`.
+- **B.** `write_markdown` 은 **`OSError` 전파** → UI 는 반드시 `try/except OSError` 로 감싸 QMessageBox.
+
+### 9.4 의존성 / 패키징
+
+- `html2text>=2024.2.26` — `requirements.txt`(architect 추가됨) + `pyproject.toml` dependencies 미러(이번에 추가).
+- 순수 파이썬·런타임 무의존(stdlib `html.parser` 사용) → **PyInstaller spec 변경 불필요**.
+  packager 는 빌드 후 frozen exe 에서 `import html2text` 만 확인.
+- 설치 검증: `html2text 2025.4.15` (하한 충족).
+
+### 9.5 검증 완료(GUI 불필요, 직접 import 스모크)
+
+- [x] PySide6 무의존(코어 import 후 `sys.modules` 에 PySide6 없음 — 확인)
+- [x] `html_to_markdown` 제목(`# 제목`)/볼드(`**굵게**`)/기울임(`_기울임_`)/링크(`[링크](url)`)/이미지(`![alt](src)`)/리스트 보존
+- [x] `html_to_markdown("")`/`("  \n ")`/`(None)` → `""`
+- [x] 깨진 HTML(`<h1>unclosed <b>bold <a href=`) → 예외 없이 str 반환
+- [x] `write_markdown` round-trip: `read_markdown(write 결과) == 원본`(한글 + CRLF/LF 혼용 개행 + BOM 없음 바이트 검증)
+- [x] `write_markdown(.../sub/note.md, ...)` 부모 디렉터리 자동 생성
+- [x] `write_markdown(path, None)` → 빈 파일
+- [x] `write_markdown(디렉터리경로, "x")` → `OSError` 전파
+- [x] 두 import 경로(`from mdviewer ...`, `from mdviewer.renderer ...`) 모두 동작, `render` 회귀 없음

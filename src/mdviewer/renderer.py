@@ -35,6 +35,8 @@ __all__ = [
     "RenderResult",
     "render",
     "read_markdown",
+    "write_markdown",
+    "html_to_markdown",
     "pygments_css",
     "slugify",
 ]
@@ -372,3 +374,102 @@ def _strip_bom(text: str) -> str:
     if text and text[0] == "﻿":
         return text[1:]
     return text
+
+
+def write_markdown(path: Path, text: str) -> None:
+    """Markdown 텍스트를 파일에 기록한다. ``read_markdown`` 과 대칭.
+
+    클립보드 붙여넣기로 만든 임시(scratch) 문서를 ``.md`` 파일로 저장할 때 쓴다.
+
+    Args:
+        path: 저장 대상 파일 경로(``.md``). 부모 디렉터리가 없으면 생성한다.
+        text: 기록할 마크다운 텍스트. ``None`` 이면 빈 문자열로 취급한다.
+
+    동작 규칙:
+        - 인코딩 **UTF-8 (BOM 없음)**. ``read_markdown`` 이 UTF-8 우선이므로 대칭.
+        - **개행 보존:** ``newline=""`` 로 열어 파이썬의 universal-newlines 자동
+          변환을 끄고 ``text`` 의 개행을 있는 그대로 기록한다(CRLF/LF 혼용 입력을
+          임의로 바꾸지 않음). round-trip(``read_markdown(write 결과) == 원본``)
+          시 본문이 보존된다.
+        - **부모 디렉터리 보장:** ``path.parent.mkdir(parents=True, exist_ok=True)``.
+        - 기존 파일이 있으면 **덮어쓴다**(truncate). 덮어쓰기 확인 UI 는 호출 측
+          (QFileDialog)이 담당하며, core 는 묻지 않고 기록한다.
+
+    Returns:
+        None.
+
+    Raises:
+        OSError: 디렉터리 생성/쓰기 실패(권한·디스크 등) 시 **그대로 전파**한다.
+            ``read_markdown`` 이 OSError 를 전파하는 것과 대칭이며, "저장 실패"는
+            사용자가 반드시 알아야 하는 사건이므로 UI 가 try/except 로 잡아
+            QMessageBox 로 알린다. (``html_to_markdown``/``render`` 와 달리 I/O
+            예외를 삼키지 않는다 — 의도된 비대칭.)
+    """
+    path = Path(path)
+    if text is None:  # type: ignore[redundant-expr]
+        text = ""
+    # 부모 디렉터리 보장(없으면 생성). 실패 시 OSError 전파.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # UTF-8(BOM 없음), 개행 보존(newline="" 로 universal-newlines 변환 끔).
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def html_to_markdown(html: str) -> str:
+    """HTML 문자열을 Markdown 텍스트로 변환한다.
+
+    클립보드의 ``text/html`` 조각(브라우저/워드 등에서 복사)을 마크다운 소스로
+    바꾸는 데 쓴다. 변환기는 ``html2text`` 를 사용한다(순수 파이썬, 무의존).
+
+    Args:
+        html: HTML 문자열. 완전한 문서(``<html>…``)든 조각(fragment)이든 허용.
+            ``None``/빈 문자열도 허용(아래 반환 규칙 참조).
+
+    Returns:
+        Markdown 텍스트(str). **항상 str 을 반환하며 절대 None 을 반환하지 않는다.**
+        - 입력이 ``None`` 또는 공백뿐이면 ``""`` 반환.
+        - 결과 끝의 잉여 개행만 가볍게 트림(``strip("\\n")``)하고 본문 내부 개행
+          구조는 보존한다(과도한 재포맷 금지).
+
+    동작 규칙(html2text 설정 — 마크다운 충실도 우선):
+        - ``body_width = 0``  → 자동 줄바꿈(wrap) 비활성. 긴 줄을 임의로 접지
+          않는다(뷰어/에디터에서 줄 깨짐 방지).
+        - ``ignore_images = False``  → 이미지를 ``![alt](src)`` 로 보존.
+        - ``ignore_links = False``   → 링크를 ``[text](href)`` 로 보존.
+        - ``ignore_emphasis = False``→ 굵게/기울임 보존.
+        - 극단 입력에도 **예외를 던지지 않는다.** 내부 오류 시 태그 제거 평문으로
+          복구한다(``render`` 의 "절대 크래시 금지" 정책과 동일 철학).
+
+    Thread-safety:
+        순수 함수(전역 가변 상태 없음). 워커 스레드에서 호출 가능.
+        ``html2text.HTML2Text`` 인스턴스는 **호출마다 새로 생성**한다(인스턴스
+        재사용 시 내부 상태가 누적될 수 있으므로 모듈 전역 공유 금지).
+
+    Raises:
+        없음(계약상 예외 비전파). 모든 내부 오류는 복구한다.
+    """
+    if not html or not html.strip():
+        return ""
+    try:
+        import html2text
+
+        # 호출마다 새 인스턴스(내부 상태 누적 방지). baseurl 기본값으로 둠.
+        converter = html2text.HTML2Text()
+        converter.body_width = 0  # 자동 wrap off (필수).
+        converter.ignore_images = False  # 이미지 ![alt](src) 보존.
+        converter.ignore_links = False  # 링크 [text](href) 보존.
+        converter.ignore_emphasis = False  # 굵게/기울임 보존.
+        result = converter.handle(html)
+        return result.strip("\n")
+    except Exception:
+        # 최후 폴백: 태그 제거 + 엔티티 unescape 평문(크래시 금지).
+        return _strip_html_tags(html)
+
+
+def _strip_html_tags(html: str) -> str:
+    """HTML 태그를 제거하고 엔티티를 복원한 평문을 반환한다(변환 폴백 전용)."""
+    import re
+    from html import unescape
+
+    text = re.sub(r"<[^>]+>", "", html or "")
+    return unescape(text).strip()

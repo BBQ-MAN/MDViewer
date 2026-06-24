@@ -19,6 +19,7 @@ dependencies = [
     "Pygments>=2.17",
     "watchdog>=4.0",
     "charset-normalizer>=3.3",
+    "html2text>=2024.2.26",
 ]
 
 [project.optional-dependencies]

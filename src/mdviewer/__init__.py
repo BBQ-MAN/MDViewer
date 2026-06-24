@@ -13,9 +13,11 @@ from mdviewer.file_watcher import FileWatcher
 from mdviewer.renderer import (
     RenderResult,
     TocItem,
+    html_to_markdown,
     pygments_css,
     read_markdown,
     render,
+    write_markdown,
 )
 
 __all__ = [
@@ -25,6 +27,8 @@ __all__ = [
     # 코어 렌더 API
     "render",
     "read_markdown",
+    "write_markdown",
+    "html_to_markdown",
     "RenderResult",
     "TocItem",
     "pygments_css",
