@@ -19,19 +19,26 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication, QIcon, QKeySequence
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QFontDatabase,
+    QGuiApplication,
+    QIcon,
+    QKeySequence,
+)
 from PySide6.QtWidgets import (
-    QApplication,
     QFileDialog,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QSplitter,
-    QWidget,
 )
 from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -104,6 +111,17 @@ _ZOOM_MIN = 0.4
 _ZOOM_MAX = 3.0
 _ZOOM_STEP = 0.1
 
+# ---- 뷰 모드(Phase 7) — settings._VALID_VIEW_MODES 리터럴과 반드시 동일 ----
+MODE_EDITOR = "editor"    # 편집기 전용 (view 숨김)
+MODE_PREVIEW = "preview"  # 프리뷰 전용 (editor 숨김) — 기존 동작
+MODE_SPLIT = "split"      # 동시 표시 (editor + view 둘 다)
+VALID_MODES = (MODE_EDITOR, MODE_PREVIEW, MODE_SPLIT)
+
+# 라이브 프리뷰 디바운스(입력 멈춤 후 렌더까지 대기).
+_LIVE_PREVIEW_DEBOUNCE_MS = 300
+# 자기 저장(write_markdown)이 유발한 watcher 이벤트를 무시할 시간 창.
+_SELF_WRITE_SUPPRESS_MS = 700
+
 
 class _WatchBridge(QObject):
     """watchdog 워커 스레드 → 메인 스레드로 시그널을 넘기는 어댑터."""
@@ -123,12 +141,17 @@ class MainWindow(QMainWindow):
         self._zoom = self.settings.zoom()
         self._pending_scroll: tuple[float, float] | None = None
         self._recent_actions: list[QAction] = []
+        # ---- 편집기/뷰 모드 상태(Phase 7) ----
+        self._view_mode: str = MODE_PREVIEW       # 현재 뷰 모드(아래 복원으로 덮어씀)
+        self._suppress_editor_signal = False      # 프로그램적 채움 시 textChanged 억제
+        self._suppress_watch_until: float = 0.0   # self-write 억제 시간 창(monotonic)
+        self._external_changed = False            # 외부 변경 미해결(배너) 플래그
 
         self.setWindowTitle("MDViewer")
         self._apply_window_icon()
         self.resize(1100, 800)
 
-        # ---- 중앙: TOC 패널 + 웹뷰 (스플리터) ----
+        # ---- 중앙: TOC 패널 + (편집기 | 웹뷰) 중첩 스플리터 ----
         self.view = QWebEngineView(self)
         self.view.setAcceptDrops(False)  # 드롭은 메인 윈도우가 처리
         self.view.loadFinished.connect(self._on_load_finished)
@@ -140,19 +163,45 @@ class MainWindow(QMainWindow):
         _ws.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
         _ws.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
 
+        # 편집기(마크다운 소스 전용) — 고정폭 글꼴, 줄바꿈 끔, 드롭은 메인 윈도우.
+        self.editor = QPlainTextEdit(self)
+        self.editor.setObjectName("sourceEditor")
+        self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.editor.setTabChangesFocus(False)
+        self.editor.setAcceptDrops(False)
+        self.editor.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.editor.setVisible(False)  # 초기 가시성은 _apply_view_mode 가 결정
+        self.editor.textChanged.connect(self._on_editor_text_changed)
+
         self.toc_list = QListWidget(self)
         self.toc_list.setObjectName("tocList")
         self.toc_list.setMaximumWidth(360)
         self.toc_list.setMinimumWidth(140)
         self.toc_list.itemClicked.connect(self._on_toc_clicked)
 
+        # 중첩: editor_preview_split[editor, view]
+        self.editor_preview_split = QSplitter(Qt.Orientation.Horizontal, self)
+        self.editor_preview_split.setObjectName("editorPreviewSplit")
+        self.editor_preview_split.addWidget(self.editor)
+        self.editor_preview_split.addWidget(self.view)
+        self.editor_preview_split.setStretchFactor(0, 1)
+        self.editor_preview_split.setStretchFactor(1, 1)
+        self.editor_preview_split.setSizes([550, 550])
+
+        # 바깥: splitter[toc_list, editor_preview_split]
         self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.splitter.addWidget(self.toc_list)
-        self.splitter.addWidget(self.view)
+        self.splitter.addWidget(self.editor_preview_split)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([240, 860])
         self.setCentralWidget(self.splitter)
+
+        # 라이브 프리뷰 디바운스 타이머(편집 → _doc_text → 재렌더).
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(_LIVE_PREVIEW_DEBOUNCE_MS)
+        self._render_timer.timeout.connect(self._commit_editor_to_preview)
 
         # ---- 파일 감시 브리지 ----
         self._bridge = _WatchBridge()
@@ -162,10 +211,8 @@ class MainWindow(QMainWindow):
         self._reload_timer = QTimer(self)
         self._reload_timer.setSingleShot(True)
         self._reload_timer.setInterval(_RELOAD_DEBOUNCE_MS)
-        # 외부 변경(watch)은 디스크 파일이 있을 때만 발생 → 디스크 재독, 스크롤 보존.
-        self._reload_timer.timeout.connect(
-            lambda: self._load_from_disk(preserve_scroll=True)
-        )
+        # 외부 변경(watch) 디바운스 만료 → 충돌 정책 적용(편집 중이면 자동 reload 금지).
+        self._reload_timer.timeout.connect(self._on_external_change_settled)
         self._watcher = None
         if _WATCHER_AVAILABLE:
             try:
@@ -182,6 +229,9 @@ class MainWindow(QMainWindow):
         self._restore_window_state()
         self._refresh_recent_menu()
         self._apply_zoom()
+        # 마지막 뷰 모드 복원(복원은 다시 저장하지 않음). 초기 _doc_text=="" 라
+        # EDITOR/SPLIT 복원돼도 편집기 동기화는 no-op 로 안전.
+        self._apply_view_mode(self.settings.view_mode(), persist=False)
         self._show_welcome()
 
     # ------------------------------------------------------------------ #
@@ -270,6 +320,27 @@ class MainWindow(QMainWindow):
         self.act_toggle_toc.triggered.connect(self.toggle_toc)
         self.toc_list.setVisible(self.settings.toc_visible())
 
+        # ---- 뷰 모드(상호배타 라디오, Ctrl+1/2/3) ----
+        self.act_mode_editor = QAction("편집기", self)
+        self.act_mode_editor.setShortcut(QKeySequence("Ctrl+1"))
+        self.act_mode_editor.setCheckable(True)
+        self.act_mode_editor.triggered.connect(self.set_mode_editor)
+
+        self.act_mode_preview = QAction("미리보기", self)
+        self.act_mode_preview.setShortcut(QKeySequence("Ctrl+2"))
+        self.act_mode_preview.setCheckable(True)
+        self.act_mode_preview.triggered.connect(self.set_mode_preview)
+
+        self.act_mode_split = QAction("분할(편집+미리보기)", self)
+        self.act_mode_split.setShortcut(QKeySequence("Ctrl+3"))
+        self.act_mode_split.setCheckable(True)
+        self.act_mode_split.triggered.connect(self.set_mode_split)
+
+        self._mode_group = QActionGroup(self)
+        self._mode_group.setExclusive(True)
+        for a in (self.act_mode_editor, self.act_mode_preview, self.act_mode_split):
+            self._mode_group.addAction(a)
+
         self.act_about = QAction("MDViewer 정보", self)
         self.act_about.triggered.connect(self.show_about)
 
@@ -292,6 +363,10 @@ class MainWindow(QMainWindow):
         m_file.addAction(self.act_exit)
 
         m_view = mb.addMenu("보기(&V)")
+        m_view.addAction(self.act_mode_editor)
+        m_view.addAction(self.act_mode_preview)
+        m_view.addAction(self.act_mode_split)
+        m_view.addSeparator()
         m_view.addAction(self.act_toggle_theme)
         m_view.addSeparator()
         m_view.addAction(self.act_zoom_in)
@@ -313,6 +388,10 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction(self.act_paste)
         tb.addAction(self.act_save)
+        tb.addSeparator()
+        tb.addAction(self.act_mode_editor)
+        tb.addAction(self.act_mode_preview)
+        tb.addAction(self.act_mode_split)
         tb.addSeparator()
         tb.addAction(self.act_zoom_out)
         tb.addAction(self.act_zoom_reset)
@@ -372,6 +451,7 @@ class MainWindow(QMainWindow):
         if not self._maybe_discard():
             return
 
+        self._clear_external_change_banner()  # 새 문서 진입 → 이전 외부변경 안내 클리어
         self._path = path
         self._pending_scroll = None  # 새 문서는 상단부터
         ok = self._load_from_disk(preserve_scroll=False)
@@ -449,6 +529,7 @@ class MainWindow(QMainWindow):
         self._doc_text = text
         self._pending_scroll = None  # 새 문서는 상단부터
         self._render_doc(preserve_scroll=False)
+        self._sync_editor_from_doc()  # 편집기를 붙여넣기 내용과 동기화(신호 억제)
         self._set_dirty(True)
         self.statusBar().showMessage("임시 문서(붙여넣기) — 저장하려면 Ctrl+S", 5000)
 
@@ -468,6 +549,115 @@ class MainWindow(QMainWindow):
         self._refresh_recent_menu()
         self._set_dirty(False)
         self.statusBar().showMessage(str(self._path))
+
+    # ------------------------------------------------------------------ #
+    # 뷰 모드 상태기계(Editor / Preview / Split)
+    # ------------------------------------------------------------------ #
+    def _apply_view_mode(self, mode: str, *, persist: bool = True) -> None:
+        """뷰 모드를 적용한다(가시성·동기화·포커스·액션·저장).
+
+        데이터(_doc_text/_dirty)를 변경하지 않는다. _maybe_discard 를 호출하지 않는다
+        (모드 전환은 데이터 변경이 아님). 프리뷰 재렌더도 하지 않는다(스크롤 보존).
+        """
+        if mode not in VALID_MODES:
+            mode = MODE_PREVIEW
+        self._view_mode = mode
+
+        show_editor = mode in (MODE_EDITOR, MODE_SPLIT)
+        show_preview = mode in (MODE_PREVIEW, MODE_SPLIT)
+
+        # EDITOR/SPLIT 진입 시 편집기를 _doc_text 와 동기화(신호 억제로 dirty 오염 방지).
+        if show_editor:
+            self._sync_editor_from_doc()
+
+        # 가시성(위젯 단위 — 스플리터는 항상 표시, 자식 hide 시 핸들 자동 접힘).
+        self.editor.setVisible(show_editor)
+        self.view.setVisible(show_preview)
+
+        # TOC: 프리뷰가 보일 때만 의미 있음. 사용자 토글값을 게이팅(덮어쓰지 않음).
+        toc_allowed = show_preview
+        self.toc_list.setVisible(toc_allowed and self.settings.toc_visible())
+        self.act_toggle_toc.setEnabled(toc_allowed)
+
+        # 상호배타 액션 체크.
+        self.act_mode_editor.setChecked(mode == MODE_EDITOR)
+        self.act_mode_preview.setChecked(mode == MODE_PREVIEW)
+        self.act_mode_split.setChecked(mode == MODE_SPLIT)
+
+        # 포커스: 편집기가 보이면 편집기에, 아니면 프리뷰에.
+        if show_editor:
+            self.editor.setFocus()
+        else:
+            self.view.setFocus()
+
+        if persist:
+            self.settings.set_view_mode(mode)
+
+        label = {MODE_EDITOR: "편집기", MODE_PREVIEW: "미리보기", MODE_SPLIT: "분할"}[mode]
+        self.statusBar().showMessage(f"보기: {label}", 1500)
+
+    def set_mode_editor(self) -> None:
+        self._apply_view_mode(MODE_EDITOR)
+
+    def set_mode_preview(self) -> None:
+        self._apply_view_mode(MODE_PREVIEW)
+
+    def set_mode_split(self) -> None:
+        self._apply_view_mode(MODE_SPLIT)
+
+    # ------------------------------------------------------------------ #
+    # 편집기 ↔ _doc_text 동기화 + 라이브 프리뷰 디바운스
+    # ------------------------------------------------------------------ #
+    def _sync_editor_from_doc(self) -> None:
+        """_doc_text 를 편집기에 반영한다(프로그램적 채움 — textChanged 억제).
+
+        이미 동일하면 setPlainText 를 건너뛰어 커서/스크롤/undo 스택을 보존한다.
+        이중 가드(억제 플래그 + blockSignals)로 textChanged 부작용을 막는다.
+
+        ★ 개행 주의: QPlainTextEdit.toPlainText() 는 CRLF/CR 을 LF 로 정규화해 돌려준다.
+        따라서 _doc_text 가 CRLF(예: read_markdown 의 바이트 충실 반환)여도 표시상
+        동일하면 재채움(setPlainText)을 건너뛰어 커서/undo 를 보존한다. 정규화 비교로
+        불필요한 재채움을 막는다(실제 데이터 _doc_text 자체는 변경하지 않음).
+        """
+        if self.editor.toPlainText() == self._normalize_newlines(self._doc_text):
+            return  # 표시상 동일 → no-op(커서/undo 보존)
+        self._suppress_editor_signal = True
+        self.editor.blockSignals(True)
+        try:
+            self.editor.setPlainText(self._doc_text)
+        finally:
+            self.editor.blockSignals(False)
+            self._suppress_editor_signal = False
+
+    @staticmethod
+    def _normalize_newlines(text: str) -> str:
+        """CRLF/CR 을 LF 로 정규화(편집기 표시 비교 전용)."""
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+
+    def _on_editor_text_changed(self) -> None:
+        """편집기 textChanged 슬롯.
+
+        프로그램적 채움이면 무시, 사용자 입력이면 즉시 dirty + 디바운스 시작.
+        """
+        if self._suppress_editor_signal:
+            return
+        self._set_dirty(True)        # 사용자 편집 = 즉시 미저장 표시
+        self._render_timer.start()   # 연속 입력은 마지막 1회로 합쳐 렌더
+
+    def _commit_editor_to_preview(self) -> None:
+        """디바운스 만료 시: 편집기 내용을 _doc_text 에 반영하고 프리뷰 재렌더."""
+        self._doc_text = self.editor.toPlainText()
+        self._render_doc(preserve_scroll=True)
+
+    def _flush_pending_edit(self) -> None:
+        """대기 중인 디바운스를 즉시 반영(저장/reload 등 _doc_text 의존 작업 전 호출).
+
+        디바운스 만료 전 사용자가 저장하면 _doc_text 가 한 박자 오래된 상태일 수 있다.
+        저장은 _doc_text 를 쓰므로, 타이머가 대기 중이면 강제 commit(렌더는 생략).
+        """
+        if self._render_timer.isActive():
+            self._render_timer.stop()
+            self._doc_text = self.editor.toPlainText()
 
     # ------------------------------------------------------------------ #
     # 붙여넣기 — 클립보드(HTML 우선 / plain 폴백) → scratch 문서
@@ -525,6 +715,10 @@ class MainWindow(QMainWindow):
     def _write_to(self, path: Path) -> bool:
         """write_markdown(core) 으로 _doc_text 저장. OSError 는 잡아 경고."""
         path = Path(path)
+        # 디바운스 대기 중인 마지막 타이핑을 _doc_text 에 반영(데이터 유실 방지).
+        self._flush_pending_edit()
+        # self-write 억제: 저장이 유발할 watcher 이벤트를 무시할 시간 창을 연다.
+        self._suppress_watch_until = time.monotonic() + (_SELF_WRITE_SUPPRESS_MS / 1000.0)
         try:
             write_markdown(path, self._doc_text)  # core 호출(OSError 전파)
         except OSError as exc:
@@ -536,6 +730,8 @@ class MainWindow(QMainWindow):
             self._attach_path(path)
         else:
             self._set_dirty(False)  # 같은 경로 재저장
+        # 디스크가 _doc_text 와 동기화됨 → 미해결 외부 변경 안내(배너)를 내린다.
+        self._clear_external_change_banner()
         suffix = "  (임시 문서를 파일로 저장)" if was_scratch else ""
         self.statusBar().showMessage(f"저장됨: {path}{suffix}", 3000)
         return True
@@ -579,6 +775,7 @@ class MainWindow(QMainWindow):
             return False
 
         self._render_doc(preserve_scroll=preserve_scroll)
+        self._sync_editor_from_doc()  # 편집기를 디스크 내용과 동기화(신호 억제)
         self._set_dirty(False)  # 디스크와 동기화됨
         return True
 
@@ -601,10 +798,15 @@ class MainWindow(QMainWindow):
         """Ctrl+R: 현재 파일을 디스크에서 다시 읽어 렌더(스크롤 보존).
 
         scratch 는 디스크 소스가 없어 새로고침 대상이 없다(no-op + 안내).
+        편집 중(dirty)이면 데이터 유실 가드(_maybe_discard) 후 진행 — 충돌 정책의 탈출구.
         """
         if self._path is None:
             self.statusBar().showMessage("임시 문서는 새로고침 대상이 없습니다.", 3000)
             return False
+        if self._dirty and not self._maybe_discard():
+            return False  # 사용자가 취소 → reload 중단(편집 내용 보호)
+        self._clear_external_change_banner()
+        # _load_from_disk 내부에서 _sync_editor_from_doc 호출됨(편집기 동기화).
         return self._load_from_disk(preserve_scroll=True)
 
     def _capture_scroll_then_render(self, result) -> None:
@@ -659,11 +861,59 @@ class MainWindow(QMainWindow):
                 pass
 
     # ------------------------------------------------------------------ #
-    # 파일 변경 콜백 (메인 스레드)
+    # 파일 변경 콜백 (메인 스레드) — 편집↔감시 충돌 정책
     # ------------------------------------------------------------------ #
     def _on_file_changed(self) -> None:
-        # 디바운스(콜백 폭주 방어) — 최종 1회만 reload.
+        """watcher 콜백(메인 스레드). self-write 시간 창 억제 후 디바운스."""
+        # 가드 A: 자기 저장(write_markdown) 직후의 이벤트는 무시(시간 창).
+        if time.monotonic() < self._suppress_watch_until:
+            return
+        # 디바운스(콜백 폭주 방어) — 최종 1회만 정책 적용.
         self._reload_timer.start()
+
+    def _on_external_change_settled(self) -> None:
+        """디바운스 만료 후 외부 변경 처리(충돌 정책 적용).
+
+        - scratch(_path None): watch 대상 아님 → 무시.
+        - 디스크 내용 == _doc_text: self-write 잔향/무변경 → 무시(가드 B).
+        - dirty(편집 중): 자동 reload 금지 → 배너/상태바 안내(편집 내용 보호).
+        - not dirty: 안전하게 자동 reload(순수 뷰어 동작 보존, 스크롤 보존).
+        """
+        if self._path is None:
+            return
+        try:
+            disk_text = read_markdown(self._path)  # core 호출(작은 파일 — 블로킹 무시)
+        except OSError:
+            self.statusBar().showMessage("외부에서 파일이 변경/삭제되었습니다.", 5000)
+            return
+        # 가드 B: 디스크 내용이 이미 _doc_text 와 같으면 reload 불필요(self-write 잔향).
+        if disk_text == self._doc_text:
+            return
+
+        if self._dirty:
+            # ★ 편집 중 미저장 변경 → 자동 reload 금지(편집 내용 보호). 비차단 안내만.
+            self._show_external_change_banner()
+            return
+
+        # dirty 아님(순수 뷰어) → 안전하게 자동 reload.
+        self._doc_text = disk_text
+        self._render_doc(preserve_scroll=True)
+        self._sync_editor_from_doc()
+        self._set_dirty(False)
+        self.statusBar().showMessage("외부 변경을 반영했습니다.", 2000)
+
+    def _show_external_change_banner(self) -> None:
+        """비차단 안내: 상태바 영구 메시지(모달 지양). 다음 액션까지 유지."""
+        self.statusBar().showMessage(
+            "⚠ 외부에서 파일이 변경되었습니다 — Ctrl+R 로 새로고침"
+            "(편집 내용은 덮어쓰여집니다)"
+        )
+        self._external_changed = True
+
+    def _clear_external_change_banner(self) -> None:
+        if self._external_changed:
+            self._external_changed = False
+            self.statusBar().clearMessage()
 
     # ------------------------------------------------------------------ #
     # TOC
@@ -764,6 +1014,7 @@ class MainWindow(QMainWindow):
             "<p style='color:gray;font-size:0.85em'>"
             "단축키: Ctrl+O 열기 · Ctrl+Shift+V 붙여넣기 · "
             "Ctrl+S 저장 · Ctrl+Shift+S 다른 이름으로 저장 · "
+            "Ctrl+1 / Ctrl+2 / Ctrl+3 편집기 / 미리보기 / 분할 · "
             "Ctrl+R 새로고침 · Ctrl+T 테마 · "
             "Ctrl+= / Ctrl+- / Ctrl+0 줌 · F11 전체화면 · Ctrl+\\ 목차</p>",
         )

@@ -20,8 +20,14 @@ _KEY_GEOMETRY = "window/geometry"
 _KEY_STATE = "window/state"
 _KEY_TOC_VISIBLE = "view/toc_visible"
 _KEY_ZOOM = "view/zoom"
+_KEY_VIEW_MODE = "view/mode"
 
 MAX_RECENT = 10
+
+# 뷰 모드 리터럴 — main_window.MODE_* 와 반드시 동일해야 한다.
+# (settings 는 main_window 를 import 하지 않는다 — 순환 import 회피.)
+_VALID_VIEW_MODES = ("editor", "preview", "split")
+_DEFAULT_VIEW_MODE = "preview"
 
 
 class Settings:
@@ -94,6 +100,15 @@ class Settings:
 
     def set_zoom(self, value: float) -> None:
         self._s.setValue(_KEY_ZOOM, float(value))
+
+    def view_mode(self) -> str:
+        """저장된 뷰 모드. 유효하지 않으면 'preview'(기본)."""
+        val = self._s.value(_KEY_VIEW_MODE, _DEFAULT_VIEW_MODE, type=str)
+        return val if val in _VALID_VIEW_MODES else _DEFAULT_VIEW_MODE
+
+    def set_view_mode(self, value: str) -> None:
+        if value in _VALID_VIEW_MODES:
+            self._s.setValue(_KEY_VIEW_MODE, value)
 
     def sync(self) -> None:
         self._s.sync()

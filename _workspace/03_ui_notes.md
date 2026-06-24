@@ -1,6 +1,47 @@
 # UI 구현 노트 (ui-dev)
 
-> 작성: ui-dev · 2026-06-01 · 갱신: 2026-06-24(Phase 6 클립보드/저장) · 대상: QA / packager / core-engine-dev
+> 작성: ui-dev · 2026-06-01 · 갱신: 2026-06-25(Phase 7 인라인 편집기/뷰 모드) · 대상: QA / packager / core-engine-dev
+
+## 0-A. Phase 7 변경 요약 (인라인 편집기 + 뷰 모드 Editor/Preview/Split + 라이브 프리뷰)
+
+설계서: `_workspace/07_editor_feature_design.md`. **소유권 준수**: `main_window.py` 수정 + `settings.py` 에 뷰모드 키 1개 추가. `renderer.py`/`file_watcher.py`/`requirements.txt`/`mdviewer.spec` **무변경**(core 변경 0 목표 달성).
+
+**신규 위젯 — `QPlainTextEdit` 편집기**: `self.editor`(objectName `sourceEditor`). 고정폭 글꼴(`QFontDatabase.systemFont(FixedFont)`), `LineWrapMode.NoWrap`, `setTabChangesFocus(False)`, `setAcceptDrops(False)`(파일 드롭은 메인 윈도우 `dropEvent`→`open_path` 가 처리, 현행 유지). `textChanged`→`_on_editor_text_changed`.
+
+**레이아웃 — 중첩 스플리터**: `centralWidget = splitter[toc_list, editor_preview_split]`, `editor_preview_split(objectName editorPreviewSplit) = [editor, view]` (stretch 1:1, 기본 sizes [550,550]). 바깥 splitter sizes [240,860]. 모드별 가시성은 `editor`/`view`/`toc_list` **위젯 단위 setVisible**(스플리터 자체는 항상 표시, 자식 hide 시 핸들 자동 접힘). split 비율 영속은 범위 외(매 실행 50:50).
+
+**뷰 모드 3종(상호배타 라디오)**:
+- 상수 `MODE_EDITOR="editor"` / `MODE_PREVIEW="preview"` / `MODE_SPLIT="split"` (settings 의 `_VALID_VIEW_MODES` 리터럴과 동일 — 순환 import 회피).
+- 액션 `act_mode_editor`(Ctrl+1) / `act_mode_preview`(Ctrl+2) / `act_mode_split`(Ctrl+3), `QActionGroup setExclusive(True)`. 슬롯 `set_mode_editor/preview/split` → `_apply_view_mode`.
+- `_apply_view_mode(mode, persist=True)`: (1)`_view_mode` 저장 (2)EDITOR/SPLIT 진입 시 `_sync_editor_from_doc` (3)editor/view setVisible (4)TOC 게이팅(프리뷰 보일 때만 + 사용자 토글값, `act_toggle_toc.setEnabled(show_preview)`) (5)액션 체크 갱신 (6)포커스(편집기 보이면 editor, 아니면 view) (7)QSettings 저장 (8)상태바 안내. **`_maybe_discard` 미호출**(모드 전환=데이터 변경 아님, dirty 불변). **프리뷰 재렌더 안 함**(setHtml 재로딩이 스크롤 튐 유발 — 가시성만 변경).
+- 기본 Preview, `__init__` 마지막에 `_apply_view_mode(settings.view_mode(), persist=False)` 로 복원. 초기 `_doc_text==""` 라 EDITOR/SPLIT 복원돼도 편집기 동기화 no-op.
+
+**라이브 프리뷰(디바운스, `_doc_text` 단일 진실원)**:
+- `_render_timer`(SingleShot, 300ms) → `_commit_editor_to_preview`.
+- 사용자 타이핑 → `_on_editor_text_changed`: `if _suppress_editor_signal: return`; `_set_dirty(True)`(즉시 미저장 표시); `_render_timer.start()`(연속 입력 합침).
+- 디바운스 만료 → `_commit_editor_to_preview`: `_doc_text = editor.toPlainText()`; `_render_doc(preserve_scroll=True)`. `_doc_text` 갱신은 디바운스 만료 시에만, dirty 는 즉시.
+- 역방향(`_doc_text`→편집기) `_sync_editor_from_doc`: **이중 가드**(`_suppress_editor_signal=True` + `editor.blockSignals(True)`)로 textChanged 억제. 표시상 동일하면 `setPlainText` 생략(커서/undo 보존). 삽입 지점: `_load_from_disk`·`_set_scratch` 의 `_render_doc` 다음 줄.
+
+**★ CRLF 라운드트립 주의(QA 필독)**: `read_markdown` 은 바이트 충실 반환이라 Windows CRLF 파일은 `_doc_text` 에 `\r\n` 으로 들어온다. 그러나 **`QPlainTextEdit.toPlainText()` 는 CRLF/CR 을 LF 로 정규화**해 돌려준다. 그래서 (a) `_sync_editor_from_doc` 의 no-op 가드는 `_normalize_newlines(_doc_text)` 와 비교(CRLF 문서에서도 불필요한 재채움/커서 손실 방지), (b) **사용자가 Editor/Split 에서 실제로 편집 후 저장하면 디바운스 commit/flush 가 `_doc_text = editor.toPlainText()` 로 LF 정규화** → 저장 파일이 LF 로 바뀐다(일반 마크다운 에디터의 표준 동작, 의도됨). **편집하지 않은 순수 모드 전환만으로는 `_doc_text` 가 변하지 않으므로 CRLF 가 보존**된다(모드 전환은 `toPlainText()` 를 `_doc_text` 에 되쓰지 않음).
+
+**★ 저장 직전 flush(데이터 유실 방지)**: `_flush_pending_edit` — `_render_timer.isActive()` 면 stop + `_doc_text = editor.toPlainText()`. `_write_to()` 진입 선행(save/save_as 모두 `_write_to` 경유 → 한 곳에서 커버). 안 하면 "마지막 타이핑이 저장 안 됨" 버그.
+
+**★ 편집↔감시 충돌 정책**:
+- self-write 억제 **가드 A(시간 창)**: `_write_to` 에서 `_suppress_watch_until = monotonic()+700ms`. `_on_file_changed` 가 시간 창 내 watcher 이벤트는 무시(reload 타이머 시작 안 함).
+- `_reload_timer.timeout` 연결을 기존 lambda(`_load_from_disk`) → **`_on_external_change_settled`** 로 교체.
+- `_on_external_change_settled`: scratch(`_path None`)면 return; **가드 B(내용 비교)** `read_markdown(_path)==_doc_text` 면 return(self-write 잔향/무변경); **dirty 면 자동 reload 금지** + `_show_external_change_banner()`(상태바 영구 메시지, 모달 지양) + return; **not-dirty 면** 기존처럼 `_doc_text=disk_text`/`_render_doc(preserve_scroll=True)`/`_sync_editor_from_doc`/`_set_dirty(False)`(순수 뷰어 동작 보존).
+- Ctrl+R(`reload_current`)은 명시적 탈출구: dirty 면 `_maybe_discard` 가드 후 reload + 배너 클리어.
+- 배너 클리어 지점: `reload_current`/`open_path`/`_write_to`(저장 성공).
+
+**메뉴/툴바/About**: 보기 메뉴 맨 위에 편집기/미리보기/분할 그룹 추가. 툴바에 붙여넣기·저장 뒤 모드 3종 추가. About 단축키 안내에 `Ctrl+1/2/3` 추가.
+
+**settings.py 추가**: `_KEY_VIEW_MODE="view/mode"`, `view_mode()`(기본 "preview", 유효성 검증), `set_view_mode()`(editor/preview/split 만 저장). 리터럴은 main_window `MODE_*` 와 동일.
+
+**검증(offscreen)**: `smoke_phase7.py` 40개 체크 전부 PASS — 모드 전환/가시성/TOC 게이팅, 디바운스(즉시 dirty + 지연 `_doc_text`), flush 후 저장 일치, 신호 억제(sync 가 dirty 오염 안 함), self-write 가드 A/B, dirty 중 외부변경 자동 reload 금지+배너, not-dirty 자동 reload, 모드 영속화. 기존 `pytest tests/` **78 passed, 1 skipped**(회귀 없음).
+
+빌드 인터프리터: `C:\Users\BBQMAN\miniconda3\python.exe`(PySide6 6.11.1).
+
+---
 
 ## 0. Phase 6 변경 요약 (클립보드 붙여넣기 · scratch 저장)
 
@@ -80,6 +121,7 @@ QApplication 의 app/org 이름을 **윈도우 생성 전에** 설정해 QSettin
 | Ctrl+Shift+V | 클립보드를 마크다운으로 붙여넣기(→ scratch 임시 문서) |
 | Ctrl+S | 저장(scratch 면 Save As) |
 | Ctrl+Shift+S | 다른 이름으로 저장 |
+| Ctrl+1 / Ctrl+2 / Ctrl+3 | 편집기 / 미리보기 / 분할 모드(상호배타) |
 | Ctrl+R | 새로고침 |
 | Ctrl+T | 테마 전환(라이트/다크) |
 | Ctrl+= / Ctrl++ | 확대 |
@@ -103,7 +145,8 @@ QApplication 의 app/org 이름을 **윈도우 생성 전에** 설정해 QSettin
 
 - Windows 레지스트리: `HKEY_CURRENT_USER\Software\MDViewer\MDViewer`.
 - 키: `recent_files`(최대 10, 중복제거, 최신 위), `theme`(light|dark),
-  `window/geometry`, `window/state`, `view/toc_visible`, `view/zoom`.
+  `window/geometry`, `window/state`, `view/toc_visible`, `view/zoom`,
+  `view/mode`(editor|preview|split, 기본 preview — Phase 7 신규).
 - 래퍼: `settings.py` 의 `Settings` 클래스(`mdviewer.settings`).
 
 ## 7. 리소스
