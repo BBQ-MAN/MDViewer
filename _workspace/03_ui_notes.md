@@ -1,6 +1,42 @@
 # UI 구현 노트 (ui-dev)
 
-> 작성: ui-dev · 2026-06-01 · 갱신: 2026-06-25(Phase 7 인라인 편집기/뷰 모드) · 대상: QA / packager / core-engine-dev
+> 작성: ui-dev · 2026-06-01 · 갱신: 2026-06-25(Phase 8 WYSIWYG 라이브 편집) · 대상: QA / packager / core-engine-dev
+
+## 0-B. Phase 8 변경 요약 (WYSIWYG 라이브 편집 — 4번째 뷰 모드)
+
+설계서: `_workspace/08_wysiwyg_feature_design.md`(계약). **소유권 준수**: `main_window.py` 수정 + `settings.py` 에 `_VALID_VIEW_MODES` 1개 값 추가. **`renderer.py`/`file_watcher.py`/`theme.py`/`requirements.txt`/`mdviewer.spec` 무변경**(core 변경 0, theme 무변경 = 런타임 querySelector 권장안 채택, §2.1 A). **JS 자산 0**(모든 JS 는 파이썬 문자열 리터럴 → `runJavaScript`).
+
+**4번째 뷰 모드 `MODE_WYSIWYG="wysiwyg"`(Ctrl+4)** — 프리뷰(`self.view`)를 contentEditable 편집 surface 로 사용. 기존 `_mode_group` QActionGroup 에 `act_mode_wysiwyg` 합류(4개 상호배타). 보기 메뉴/메인 툴바/About 갱신(About 에 Ctrl+4 + WYSIWYG 정규화 안내 1줄).
+
+**`_apply_view_mode` 전이 훅(★)**: prev_mode 보관 → (A) `prev==WYSIWYG and mode!=WYSIWYG` 면 `_view_mode` 갱신 **전에** `_exit_wysiwyg()` → 가시성/툴바/액션체크 → (B) `mode==WYSIWYG and prev!=WYSIWYG` 면 setVisible **후** `_enter_wysiwyg()`. `prev==mode` 가드로 동일모드 재클릭 시 enter/exit 둘 다 skip(폴링 유지). 가시성: WYSIWYG=editor hide / view show / format_toolbar show / toc 사용자토글값.
+
+**진입 `_enter_wysiwyg()`**: `_flush_pending_edit()`(소스 디바운스) → **front-matter 가드**(`_has_front_matter` = `^\s*---\r?\n`; 있으면 QMessageBox Yes/No, No 면 `_apply_view_mode(PREVIEW)` 강등) → `render(_doc_text, base_dir)` → `theme.wrap_document` → `_wysiwyg_active=True` / `_wysiwyg_last_html=None` / `_wysiwyg_pending_setup=True` → `view.setHtml`(★ `_render_doc` 미경유, 1회 프로그램적 렌더) → `_populate_toc`(진입 1회만). `loadFinished`(`_on_load_finished`)에서 `_wysiwyg_pending_setup` 면 `_activate_editable_then_baseline()` 호출 → JS 로 `article.markdown-body` 에 `id=md-editable`+`contenteditable=true`+focus 부여, 콜백에서 초기 innerHTML 을 베이스라인으로 저장 + `_wysiwyg_poll.start()`.
+
+**편집 캡처(폴링)**: `_wysiwyg_poll` QTimer 400ms(WYSIWYG 동안만 active) → `_wysiwyg_poll_tick` → `_capture_wysiwyg_once(final=False)` → `runJavaScript(getElementById('md-editable').innerHTML)` 콜백 → `_ingest_wysiwyg_html`. **`_ingest` 규율(★★)**: 베이스라인(`_wysiwyg_last_html`)과 **다를 때만** `html_to_markdown(html)`→`_doc_text` 갱신+`_set_dirty(True)`. **절대 `_render_doc`/`_set_document`/`setHtml`/`_populate_toc` 안 부름**(커서/선택/스크롤 보존). 진입 직후 무변화는 베이스라인 동일 → no-op(dirty 오염·무한진동 차단).
+
+**서식 툴바 `formatToolbar`(신규 QToolBar, WYSIWYG 에서만 setVisible)**: `_build_format_toolbar` 에서 `act_fmt_*` 생성. 명령→`_exec_format`→`page().runJavaScript`: 굵게 `bold`·기울임 `italic`·취소선 `strikeThrough`; H1/H2/H3/본문 `formatBlock(H1/H2/H3/P)`; 불릿 `insertUnorderedList`·번호 `insertOrderedList`; 인용 `formatBlock(BLOCKQUOTE)`; 인라인코드=커스텀 JS(`getSelection`/`extractContents`/`insertNode <code>`, 선택없으면 no-op); 링크=`QInputDialog.getText`→`createLink`; 서식지우기 `removeFormat`+`formatBlock(P)`. 각 명령 후 `_capture_wysiwyg_once(final=False)` 즉시 1회 캡처(폴링 백업). **포맷 액션엔 단축키 부여 안 함**(전역 Ctrl+B 충돌 회피, v1 클릭 전용).
+
+**역렌더 게이트(★★ 무한루프/커서 방지)**: `_render_doc` 맨 앞 `if self._wysiwyg_active: return`. `_commit_editor_to_preview` 도 동일 방어(소스 편집기 숨김이라 도달 안 하지만). `_on_external_change_settled` 에 **가드 C**: `if self._wysiwyg_active:` → 배너만(편집 surface 덮어쓰기 금지). 단 진입 시 1회 setHtml 은 게이트를 우회(`_enter_wysiwyg` 직접 호출).
+
+**이탈/flush(★ 비동기)**: `_exit_wysiwyg()` = `poll.stop()` → `_wysiwyg_active=False` → `_capture_wysiwyg_once(final=True)`(마지막 flush, 비동기 콜백) → editable 해제 JS. final 콜백 안에서 다음 모드가 Editor/Split 면 `_sync_editor_from_doc()` 보정(§2.4 경합 — 마지막 글자 유실 방지). **이탈은 화면을 재렌더하지 않음**(편집 결과가 이미 화면에 있으므로 가시성만 전환, flush 는 `_doc_text` 만 확정).
+
+**저장(★ WYSIWYG 비동기)**: `save()` 가 `_wysiwyg_active` 면 `_save_after_wysiwyg_capture()`(캡처 콜백 **안에서** `_write_to`/`save_as` 수행) → 마지막 타이핑까지 반영(폴링 tick 전 저장해도 유실 없음). `_write_to`/`write_markdown` 무변경.
+
+**테마 전환(WYSIWYG, 편집 보존)**: `toggle_theme` 가 `_wysiwyg_active` 면 `poll.stop()` → 캡처 콜백 안에서 `_doc_text` 확정 → `_wysiwyg_active=False` → `_enter_wysiwyg()`(새 테마로 재진입, setHtml 1회). 커서가 문서 처음으로 이동할 수 있음(v1 수용, 상태바 안내).
+
+**문서 교체(open/paste/Ctrl+R)**: 각 진입부 `_maybe_discard()` 통과 후 `_leave_wysiwyg_for_document_change()`(=`_apply_view_mode(PREVIEW)` → `_exit_wysiwyg` 자동) 호출 → 새 문서는 일반 렌더. **진입은 오직 Ctrl+4(또는 QSettings 복원)로만**.
+
+**종료/discard 경합 안전**: `closeEvent` 가 `_wysiwyg_active` 면 `_exit_wysiwyg()` 후 `processEvents(~200ms)` 로 캡처 콜백 안착 → 이후 `_maybe_discard` 의 Save 가 최신 `_doc_text` 사용. `_maybe_discard` 의 Save 분기도 WYSIWYG 면 `save()` 후 `processEvents` 로 비동기 write 안착 + `return not self._dirty`(문서 교체 전 옛 _path 로 쓰기 완료 보장).
+
+**복원 가드**: `__init__` 복원부 `if restored==MODE_WYSIWYG and not self._doc_text: restored=MODE_PREVIEW`(빈 문서 WYSIWYG 어색함 방지). `_show_welcome()` 를 `_apply_view_mode` 전에 호출(빈 첫 실행은 항상 Preview 로 강등되므로 무해).
+
+**라운드트립 한계(★ QA/문서)**: `innerHTML → html_to_markdown(html2text) → _doc_text` 는 비가역 정규화 가능 — 목록 마커(`-`/`*`/`+`) 통일, 단락/줄바꿈 재배치(`body_width=0` 로 wrap 만 방지), 코드블록 언어 힌트 일부 유실, **front-matter 유실(→ 진입 경고/차단으로 방어)**. 내용은 보존. WYSIWYG↔소스 반복 전환 시 표기 통일됨. About 다이얼로그에 1줄 안내.
+
+**검증(offscreen)**: `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_CHROMIUM_FLAGS='--disable-gpu --in-process-gpu --no-sandbox'` 에서 WYSIWYG 스모크 **20/20 PASS** — 진입(모드/active/툴바/가시성), loadFinished 후 `contenteditable==true` 확인, 베이스라인 캡처, 진입 직후 not-dirty, 편집 주입→폴링 캡처→`**BOLD-ADDED**` 마크다운 변환→`_doc_text`+dirty, execCommand bold no-crash, 이탈 후 active=False/poll stop/툴바 hide/`_doc_text` 보존, 역렌더 게이트, front-matter 감지. 기존 `pytest tests/` **78 passed, 1 skipped**(회귀 없음). 모드 리터럴 settings↔main 동일 확인.
+
+**frozen 자산**: 신규 .js/datas/hiddenimports/런타임 의존성 **0**. `mdviewer.spec`/`requirements.txt` 무변경. packager 작업 = WYSIWYG setHtml→editable→execCommand frozen 스모크 1회만(인라인 JS 라 경로의존 없음).
+
+---
 
 ## 0-A. Phase 7 변경 요약 (인라인 편집기 + 뷰 모드 Editor/Preview/Split + 라이브 프리뷰)
 
@@ -146,7 +182,7 @@ QApplication 의 app/org 이름을 **윈도우 생성 전에** 설정해 QSettin
 - Windows 레지스트리: `HKEY_CURRENT_USER\Software\MDViewer\MDViewer`.
 - 키: `recent_files`(최대 10, 중복제거, 최신 위), `theme`(light|dark),
   `window/geometry`, `window/state`, `view/toc_visible`, `view/zoom`,
-  `view/mode`(editor|preview|split, 기본 preview — Phase 7 신규).
+  `view/mode`(editor|preview|split|wysiwyg, 기본 preview — Phase 7, wysiwyg Phase 8).
 - 래퍼: `settings.py` 의 `Settings` 클래스(`mdviewer.settings`).
 
 ## 7. 리소스

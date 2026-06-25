@@ -33,6 +33,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QFileDialog,
+    QInputDialog,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -111,16 +112,23 @@ _ZOOM_MIN = 0.4
 _ZOOM_MAX = 3.0
 _ZOOM_STEP = 0.1
 
-# ---- 뷰 모드(Phase 7) — settings._VALID_VIEW_MODES 리터럴과 반드시 동일 ----
+# ---- 뷰 모드(Phase 7/8) — settings._VALID_VIEW_MODES 리터럴과 반드시 동일 ----
 MODE_EDITOR = "editor"    # 편집기 전용 (view 숨김)
 MODE_PREVIEW = "preview"  # 프리뷰 전용 (editor 숨김) — 기존 동작
 MODE_SPLIT = "split"      # 동시 표시 (editor + view 둘 다)
-VALID_MODES = (MODE_EDITOR, MODE_PREVIEW, MODE_SPLIT)
+MODE_WYSIWYG = "wysiwyg"  # 라이브 편집 (프리뷰가 편집 surface — Phase 8)
+VALID_MODES = (MODE_EDITOR, MODE_PREVIEW, MODE_SPLIT, MODE_WYSIWYG)
 
 # 라이브 프리뷰 디바운스(입력 멈춤 후 렌더까지 대기).
 _LIVE_PREVIEW_DEBOUNCE_MS = 300
 # 자기 저장(write_markdown)이 유발한 watcher 이벤트를 무시할 시간 창.
 _SELF_WRITE_SUPPRESS_MS = 700
+
+# ---- WYSIWYG(Phase 8) ----
+# 편집 캡처 폴링 주기(디바운스 효과 — 변화 없으면 비용 0, runJavaScript 는 논블로킹).
+_WYSIWYG_POLL_MS = 400
+# contentEditable 컨테이너 element id(진입 JS 가 article.markdown-body 에 런타임 부여).
+_WYSIWYG_ROOT_ID = "md-editable"
 
 
 class _WatchBridge(QObject):
@@ -146,6 +154,10 @@ class MainWindow(QMainWindow):
         self._suppress_editor_signal = False      # 프로그램적 채움 시 textChanged 억제
         self._suppress_watch_until: float = 0.0   # self-write 억제 시간 창(monotonic)
         self._external_changed = False            # 외부 변경 미해결(배너) 플래그
+        # ---- WYSIWYG 라이브 편집 상태(Phase 8) ----
+        self._wysiwyg_active: bool = False            # WYSIWYG 진입 중인가(역렌더 게이트)
+        self._wysiwyg_last_html: str | None = None    # 마지막 편집 컨테이너 innerHTML(변화 감지)
+        self._wysiwyg_pending_setup: bool = False     # loadFinished 에서 editable 셋업 트리거
 
         self.setWindowTitle("MDViewer")
         self._apply_window_icon()
@@ -203,6 +215,11 @@ class MainWindow(QMainWindow):
         self._render_timer.setInterval(_LIVE_PREVIEW_DEBOUNCE_MS)
         self._render_timer.timeout.connect(self._commit_editor_to_preview)
 
+        # WYSIWYG innerHTML 폴링 타이머(WYSIWYG 동안에만 active — 편집 캡처).
+        self._wysiwyg_poll = QTimer(self)
+        self._wysiwyg_poll.setInterval(_WYSIWYG_POLL_MS)
+        self._wysiwyg_poll.timeout.connect(self._wysiwyg_poll_tick)
+
         # ---- 파일 감시 브리지 ----
         self._bridge = _WatchBridge()
         self._bridge.fileChanged.connect(
@@ -223,6 +240,7 @@ class MainWindow(QMainWindow):
         self._build_actions()
         self._build_menus()
         self._build_toolbar()
+        self._build_format_toolbar()  # WYSIWYG 전용 서식 툴바(초기 숨김)
         self.statusBar().showMessage("준비됨")
 
         self.setAcceptDrops(True)
@@ -231,8 +249,12 @@ class MainWindow(QMainWindow):
         self._apply_zoom()
         # 마지막 뷰 모드 복원(복원은 다시 저장하지 않음). 초기 _doc_text=="" 라
         # EDITOR/SPLIT 복원돼도 편집기 동기화는 no-op 로 안전.
-        self._apply_view_mode(self.settings.view_mode(), persist=False)
+        # ★ WYSIWYG 복원 + 빈 문서면 Preview 로 강등(빈 편집 surface 어색함 방지, §5/§9).
+        restored = self.settings.view_mode()
+        if restored == MODE_WYSIWYG and not self._doc_text:
+            restored = MODE_PREVIEW
         self._show_welcome()
+        self._apply_view_mode(restored, persist=False)
 
     # ------------------------------------------------------------------ #
     # 아이콘 / 윈도우 상태
@@ -336,9 +358,19 @@ class MainWindow(QMainWindow):
         self.act_mode_split.setCheckable(True)
         self.act_mode_split.triggered.connect(self.set_mode_split)
 
+        self.act_mode_wysiwyg = QAction("라이브 편집", self)
+        self.act_mode_wysiwyg.setShortcut(QKeySequence("Ctrl+4"))
+        self.act_mode_wysiwyg.setCheckable(True)
+        self.act_mode_wysiwyg.triggered.connect(self.set_mode_wysiwyg)
+
         self._mode_group = QActionGroup(self)
         self._mode_group.setExclusive(True)
-        for a in (self.act_mode_editor, self.act_mode_preview, self.act_mode_split):
+        for a in (
+            self.act_mode_editor,
+            self.act_mode_preview,
+            self.act_mode_split,
+            self.act_mode_wysiwyg,
+        ):
             self._mode_group.addAction(a)
 
         self.act_about = QAction("MDViewer 정보", self)
@@ -366,6 +398,7 @@ class MainWindow(QMainWindow):
         m_view.addAction(self.act_mode_editor)
         m_view.addAction(self.act_mode_preview)
         m_view.addAction(self.act_mode_split)
+        m_view.addAction(self.act_mode_wysiwyg)
         m_view.addSeparator()
         m_view.addAction(self.act_toggle_theme)
         m_view.addSeparator()
@@ -392,6 +425,7 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_mode_editor)
         tb.addAction(self.act_mode_preview)
         tb.addAction(self.act_mode_split)
+        tb.addAction(self.act_mode_wysiwyg)
         tb.addSeparator()
         tb.addAction(self.act_zoom_out)
         tb.addAction(self.act_zoom_reset)
@@ -399,6 +433,128 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction(self.act_toggle_theme)
         tb.addAction(self.act_toggle_toc)
+
+    # ------------------------------------------------------------------ #
+    # 서식 툴바(WYSIWYG 전용) — execCommand 매핑(Phase 8)
+    # ------------------------------------------------------------------ #
+    def _build_format_toolbar(self) -> None:
+        """라이브 편집(WYSIWYG)용 서식 툴바. WYSIWYG 모드에서만 표시(§3.3).
+
+        포맷 액션에는 단축키를 부여하지 않는다(전역 Ctrl+B 등 충돌·모드의존 복잡도
+        회피, v1 툴바 클릭 전용). 각 명령은 page().runJavaScript 로 실행.
+        """
+        tb = self.addToolBar("서식")
+        tb.setObjectName("formatToolbar")
+        tb.setMovable(False)
+        self.format_toolbar = tb
+
+        self.act_fmt_bold = self._mk_fmt("굵게", lambda: self._exec_format("bold"))
+        self.act_fmt_italic = self._mk_fmt("기울임", lambda: self._exec_format("italic"))
+        self.act_fmt_strike = self._mk_fmt(
+            "취소선", lambda: self._exec_format("strikeThrough")
+        )
+        self.act_fmt_h1 = self._mk_fmt("H1", lambda: self._exec_format("formatBlock", "H1"))
+        self.act_fmt_h2 = self._mk_fmt("H2", lambda: self._exec_format("formatBlock", "H2"))
+        self.act_fmt_h3 = self._mk_fmt("H3", lambda: self._exec_format("formatBlock", "H3"))
+        self.act_fmt_p = self._mk_fmt("본문", lambda: self._exec_format("formatBlock", "P"))
+        self.act_fmt_ul = self._mk_fmt(
+            "• 목록", lambda: self._exec_format("insertUnorderedList")
+        )
+        self.act_fmt_ol = self._mk_fmt(
+            "1. 목록", lambda: self._exec_format("insertOrderedList")
+        )
+        self.act_fmt_quote = self._mk_fmt(
+            "인용", lambda: self._exec_format("formatBlock", "BLOCKQUOTE")
+        )
+        self.act_fmt_code = self._mk_fmt("코드", self._fmt_inline_code)
+        self.act_fmt_link = self._mk_fmt("링크", self._fmt_insert_link)
+        self.act_fmt_clear = self._mk_fmt("서식 지우기", self._fmt_clear)
+
+        # 굵게/기울임/취소선 ─ H1/H2/H3/본문 ─ 목록 ─ 인용/코드/링크 ─ 서식지우기
+        tb.addAction(self.act_fmt_bold)
+        tb.addAction(self.act_fmt_italic)
+        tb.addAction(self.act_fmt_strike)
+        tb.addSeparator()
+        tb.addAction(self.act_fmt_h1)
+        tb.addAction(self.act_fmt_h2)
+        tb.addAction(self.act_fmt_h3)
+        tb.addAction(self.act_fmt_p)
+        tb.addSeparator()
+        tb.addAction(self.act_fmt_ul)
+        tb.addAction(self.act_fmt_ol)
+        tb.addSeparator()
+        tb.addAction(self.act_fmt_quote)
+        tb.addAction(self.act_fmt_code)
+        tb.addAction(self.act_fmt_link)
+        tb.addSeparator()
+        tb.addAction(self.act_fmt_clear)
+
+        tb.setVisible(False)  # _apply_view_mode 가 WYSIWYG 에서만 표시.
+
+    def _mk_fmt(self, label: str, slot) -> QAction:
+        a = QAction(label, self)
+        a.triggered.connect(slot)
+        return a
+
+    def _exec_format(self, command: str, value: str | None = None) -> None:
+        """WYSIWYG 편집 루트에 execCommand 적용 후 즉시 1회 캡처(폴링 보조).
+
+        WYSIWYG 모드가 아니면 no-op(툴바는 모드에서만 표시되나 방어적).
+        """
+        if not self._wysiwyg_active:
+            return
+        if value is None:
+            js = "document.execCommand(%r, false, null);" % command
+        else:
+            js = "document.execCommand(%r, false, %r);" % (command, value)
+        try:
+            self.view.page().runJavaScript(js)
+        except Exception:
+            pass
+        # 서식 적용 직후 한 번 더 캡처(폴링 대기 없이 빠른 반영). DOM 반영이 한 틱
+        # 늦으면 다음 폴링 tick 이 백업한다(best-effort).
+        self._capture_wysiwyg_once(final=False)
+
+    def _fmt_inline_code(self) -> None:
+        """선택 영역을 <code> 로 감싼다(execCommand 미지원 → 커스텀 JS).
+
+        선택이 없으면 no-op(빈 코드 삽입 방지). html_to_markdown 이 <code>→`code`
+        로 변환하므로 라운드트립 성립.
+        """
+        if not self._wysiwyg_active:
+            return
+        js = (
+            "(function(){"
+            " var sel=window.getSelection();"
+            " if(!sel || sel.rangeCount===0 || sel.isCollapsed) return;"
+            " var r=sel.getRangeAt(0);"
+            " var code=document.createElement('code');"
+            " try{ code.appendChild(r.extractContents()); r.insertNode(code); }"
+            " catch(e){}"
+            "})()"
+        )
+        try:
+            self.view.page().runJavaScript(js)
+        except Exception:
+            pass
+        self._capture_wysiwyg_once(final=False)
+
+    def _fmt_insert_link(self) -> None:
+        """URL 을 Qt 입력 다이얼로그로 받아 선택 영역을 링크로(createLink)."""
+        if not self._wysiwyg_active:
+            return
+        url, ok = QInputDialog.getText(self, "링크 삽입", "URL:")
+        if not ok or not url.strip():
+            return
+        # createLink 는 현재 선택을 링크로. 선택이 없으면 일부 Chromium 에서 no-op(v1 수용).
+        self._exec_format("createLink", url.strip())
+
+    def _fmt_clear(self) -> None:
+        """인라인 서식 제거 + 블록을 본문(P)으로 환원."""
+        if not self._wysiwyg_active:
+            return
+        self._exec_format("removeFormat")
+        self._exec_format("formatBlock", "P")
 
     # ------------------------------------------------------------------ #
     # 최근 파일 메뉴
@@ -451,6 +607,8 @@ class MainWindow(QMainWindow):
         if not self._maybe_discard():
             return
 
+        # 문서 교체 → WYSIWYG 라이브 편집을 빠져나온다(새 문서는 일반 렌더, §4.6).
+        self._leave_wysiwyg_for_document_change()
         self._clear_external_change_banner()  # 새 문서 진입 → 이전 외부변경 안내 클리어
         self._path = path
         self._pending_scroll = None  # 새 문서는 상단부터
@@ -554,17 +712,33 @@ class MainWindow(QMainWindow):
     # 뷰 모드 상태기계(Editor / Preview / Split)
     # ------------------------------------------------------------------ #
     def _apply_view_mode(self, mode: str, *, persist: bool = True) -> None:
-        """뷰 모드를 적용한다(가시성·동기화·포커스·액션·저장).
+        """뷰 모드를 적용한다(가시성·동기화·포커스·액션·저장·WYSIWYG 전이).
 
-        데이터(_doc_text/_dirty)를 변경하지 않는다. _maybe_discard 를 호출하지 않는다
-        (모드 전환은 데이터 변경이 아님). 프리뷰 재렌더도 하지 않는다(스크롤 보존).
+        데이터(_doc_text/_dirty)를 변경하지 않는다(WYSIWYG flush 는 _doc_text 를 확정만).
+        _maybe_discard 를 호출하지 않는다(모드 전환은 데이터 변경이 아님). 일반 모드
+        간 전환은 프리뷰를 재렌더하지 않는다(스크롤 보존).
+
+        ★ WYSIWYG 전이(§1.3):
+          - 이전이 WYSIWYG 이고 새 모드가 다르면 _view_mode 갱신 전에 _exit_wysiwyg()
+            (flush + 폴링 stop + editable 해제).
+          - 새 모드가 WYSIWYG 이고 이전이 다르면 가시성 setVisible 후 _enter_wysiwyg()
+            (render→editable setHtml + 폴링 시작).
+          - prev==mode 가드로 동일 모드 재클릭 시 enter/exit 둘 다 건너뜀(폴링 유지).
         """
         if mode not in VALID_MODES:
             mode = MODE_PREVIEW
+
+        prev_mode = self._view_mode
+
+        # ── (A) WYSIWYG 이탈: _view_mode 갱신 전에 flush + 정리(_exit 가드와 정합). ──
+        if prev_mode == MODE_WYSIWYG and mode != MODE_WYSIWYG:
+            self._exit_wysiwyg()
+
         self._view_mode = mode
 
         show_editor = mode in (MODE_EDITOR, MODE_SPLIT)
-        show_preview = mode in (MODE_PREVIEW, MODE_SPLIT)
+        show_preview = mode in (MODE_PREVIEW, MODE_SPLIT, MODE_WYSIWYG)
+        show_format_toolbar = mode == MODE_WYSIWYG
 
         # EDITOR/SPLIT 진입 시 편집기를 _doc_text 와 동기화(신호 억제로 dirty 오염 방지).
         if show_editor:
@@ -574,7 +748,10 @@ class MainWindow(QMainWindow):
         self.editor.setVisible(show_editor)
         self.view.setVisible(show_preview)
 
-        # TOC: 프리뷰가 보일 때만 의미 있음. 사용자 토글값을 게이팅(덮어쓰지 않음).
+        # 서식 툴바: WYSIWYG 에서만 표시.
+        self.format_toolbar.setVisible(show_format_toolbar)
+
+        # TOC: 프리뷰류(WYSIWYG 포함)가 보일 때만 의미. 사용자 토글값 게이팅(덮지 않음).
         toc_allowed = show_preview
         self.toc_list.setVisible(toc_allowed and self.settings.toc_visible())
         self.act_toggle_toc.setEnabled(toc_allowed)
@@ -583,8 +760,17 @@ class MainWindow(QMainWindow):
         self.act_mode_editor.setChecked(mode == MODE_EDITOR)
         self.act_mode_preview.setChecked(mode == MODE_PREVIEW)
         self.act_mode_split.setChecked(mode == MODE_SPLIT)
+        self.act_mode_wysiwyg.setChecked(mode == MODE_WYSIWYG)
 
-        # 포커스: 편집기가 보이면 편집기에, 아니면 프리뷰에.
+        # ── (B) WYSIWYG 진입: editable setHtml + 폴링 시작(이전이 WYSIWYG 가 아닐 때만). ──
+        if mode == MODE_WYSIWYG and prev_mode != MODE_WYSIWYG:
+            if not self._enter_wysiwyg():
+                # 진입 취소(front-matter 거부) → 내부에서 이미 _apply_view_mode(PREVIEW)
+                # 재귀로 Preview 상태/가시성/액션/persist 를 확정했다. 이 바깥 호출은
+                # 남은 focus/persist/status(WYSIWYG)를 적용하면 안 되므로 즉시 중단.
+                return
+
+        # 포커스: 편집기가 보이면 편집기에, 아니면 프리뷰/편집 surface 에.
         if show_editor:
             self.editor.setFocus()
         else:
@@ -593,7 +779,12 @@ class MainWindow(QMainWindow):
         if persist:
             self.settings.set_view_mode(mode)
 
-        label = {MODE_EDITOR: "편집기", MODE_PREVIEW: "미리보기", MODE_SPLIT: "분할"}[mode]
+        label = {
+            MODE_EDITOR: "편집기",
+            MODE_PREVIEW: "미리보기",
+            MODE_SPLIT: "분할",
+            MODE_WYSIWYG: "라이브 편집",
+        }[mode]
         self.statusBar().showMessage(f"보기: {label}", 1500)
 
     def set_mode_editor(self) -> None:
@@ -604,6 +795,179 @@ class MainWindow(QMainWindow):
 
     def set_mode_split(self) -> None:
         self._apply_view_mode(MODE_SPLIT)
+
+    def set_mode_wysiwyg(self) -> None:
+        self._apply_view_mode(MODE_WYSIWYG)
+
+    # ------------------------------------------------------------------ #
+    # WYSIWYG 라이브 편집(Phase 8) — 진입/이탈/캡처/동기화
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _has_front_matter(text: str) -> bool:
+        """문서가 front-matter(--- 로 시작하는 머리말)로 시작하는가(§8.1)."""
+        import re
+
+        return bool(re.match(r"^\s*---\r?\n", text or ""))
+
+    def _enter_wysiwyg(self) -> bool:
+        """WYSIWYG 진입: _doc_text 를 렌더해 editable surface 로 띄우고 폴링 시작.
+
+        ★ 이 setHtml 은 '프로그램적' 렌더다(_render_doc 미경유). 이후 사용자 편집은
+           폴링으로만 캡처하며 webview 를 다시 그리지 않는다(역렌더 금지 — 커서 보존).
+
+        front-matter 문서는 라운드트립에서 머리말이 유실되므로 진입 전에 경고/차단한다
+        (§8.1 A안). 사용자가 취소하면 Preview 로 강등하고 진입하지 않는다.
+
+        Returns:
+            True = 진입 완료, False = 진입 취소(front-matter 거부 → Preview 강등).
+            False 면 호출 측(_apply_view_mode)이 남은 처리를 중단해야 한다.
+        """
+        self._flush_pending_edit()  # 소스 편집기 잔여 디바운스 반영(Phase 7)
+
+        # front-matter 유실 가드(데이터 안전 — 필수).
+        if self._has_front_matter(self._doc_text):
+            btn = QMessageBox.question(
+                self,
+                "라이브 편집 경고",
+                "이 문서는 머리말(front-matter, --- 블록)을 포함합니다.\n"
+                "라이브 편집(WYSIWYG)으로 편집하면 머리말이 유실될 수 있습니다.\n\n"
+                "계속하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if btn != QMessageBox.StandardButton.Yes:
+                # 진입 취소 → Preview 로 강등(_apply_view_mode 가 가시성/액션 정합).
+                self._apply_view_mode(MODE_PREVIEW)
+                return False
+
+        base_dir = self._path.parent if self._path else self._scratch_base_dir()
+        result = render(self._doc_text, base_dir=base_dir)  # 계약상 예외 없음
+        body = getattr(result, "html", "") or ""
+        dark = self._theme == theme_mod.DARK
+        html = theme_mod.wrap_document(body, dark)
+        base = QUrl.fromLocalFile(str(base_dir) + "/")
+
+        self._wysiwyg_active = True       # ★ 역렌더 게이트 ON(이후 _render_doc no-op)
+        self._wysiwyg_last_html = None    # 베이스라인 미설정 표시
+        self._pending_scroll = None
+        self._wysiwyg_pending_setup = True  # loadFinished 에서 editable 셋업 트리거
+        self.view.setHtml(html, base)
+        self._populate_toc(getattr(result, "toc", []) or [])  # 진입 시 1회 TOC 갱신
+        self.statusBar().showMessage(
+            "라이브 편집(WYSIWYG) — 툴바로 서식 적용, 변경은 자동 저장 대상. "
+            "마크다운 소스는 정규화될 수 있습니다.",
+            5000,
+        )
+        return True
+
+    def _activate_editable_then_baseline(self) -> None:
+        """article 을 contentEditable 로 만들고 초기 innerHTML 을 베이스라인으로 캡처.
+
+        theme.py 무변경(런타임 querySelector 권장안 §2.1). 페이지 로드 완료 후에만
+        DOM 조작 가능 → _on_load_finished 에서 호출.
+        """
+        js_enable = (
+            "(function(){"
+            " var a = document.querySelector('article.markdown-body');"
+            " if(!a) return null;"
+            " a.id = %r;"
+            " a.setAttribute('contenteditable','true');"
+            " a.focus();"
+            " return a.innerHTML;"
+            "})()" % _WYSIWYG_ROOT_ID
+        )
+
+        def _cb(initial_html) -> None:
+            # 베이스라인 = 진입 시점 innerHTML. 이후 폴링이 이 값과 다르면 사용자 편집.
+            self._wysiwyg_last_html = initial_html if isinstance(initial_html, str) else ""
+            if self._wysiwyg_active:
+                self._wysiwyg_poll.start()  # 폴링 시작(이탈/모드전환 시 stop).
+
+        try:
+            self.view.page().runJavaScript(js_enable, 0, _cb)
+        except Exception:
+            # editable 부여 실패 → WYSIWYG 무력화(크래시 금지). 폴링 미시작.
+            self._wysiwyg_active = False
+
+    def _exit_wysiwyg(self) -> None:
+        """WYSIWYG 이탈: 폴링 중지 + 마지막 1회 flush(최신 편집 반영) + editable 해제.
+
+        ★ flush(_capture_wysiwyg_once)는 runJavaScript 콜백이라 비동기다. 화면(webview)은
+           건드리지 않고 _doc_text 만 확정한다(편집 결과가 그대로 화면에 남아 있으므로
+           모드 전환 시 재렌더 불필요 — §2.3). 다음 모드가 Editor/Split 이면 콜백 안에서
+           _sync_editor_from_doc 로 편집기를 보정한다(§2.4 비동기 경합 처리).
+        """
+        self._wysiwyg_poll.stop()
+        self._wysiwyg_active = False   # 역렌더 게이트 OFF(이제 _render_doc 허용).
+        self._wysiwyg_pending_setup = False
+        self._capture_wysiwyg_once(final=True)  # 마지막 동기화(비동기 콜백).
+        # editable 해제(다음 일반 렌더가 setHtml 로 덮으나 명시적 정리).
+        try:
+            self.view.page().runJavaScript(
+                "(function(){var a=document.getElementById(%r);"
+                "if(a) a.removeAttribute('contenteditable');})()" % _WYSIWYG_ROOT_ID
+            )
+        except Exception:
+            pass
+
+    def _leave_wysiwyg_for_document_change(self) -> None:
+        """문서 교체(open/paste/reload) 전 WYSIWYG 정리 → Preview 강등(§4.6).
+
+        데이터(_doc_text)는 _exit_wysiwyg 의 flush 로 보존된다. 새 문서는 Preview 에서
+        뜬다(WYSIWYG 유지하려면 사용자가 다시 Ctrl+4). 설계 단순화: 문서 교체는
+        항상 WYSIWYG 를 빠져나온다(진입은 오직 Ctrl+4/복원으로만).
+        """
+        if self._wysiwyg_active or self._view_mode == MODE_WYSIWYG:
+            self._apply_view_mode(MODE_PREVIEW)  # _exit_wysiwyg() 자동 호출(§1.3 A).
+
+    def _wysiwyg_poll_tick(self) -> None:
+        """폴링 주기마다 편집 컨테이너 innerHTML 을 비동기 취득해 변화 시 동기화."""
+        if not self._wysiwyg_active:
+            self._wysiwyg_poll.stop()
+            return
+        self._capture_wysiwyg_once(final=False)
+
+    def _capture_wysiwyg_once(self, *, final: bool) -> None:
+        """편집 컨테이너 innerHTML 1회 취득 → html_to_markdown → _doc_text 갱신.
+
+        final=True(이탈)면 콜백에서 편집기 동기화까지(다음 모드가 편집기류일 때) 보정해
+        "마지막에 친 글자가 소스 편집기/저장에 누락" 버그를 막는다(§2.4).
+        """
+        js_get = (
+            "(function(){var a=document.getElementById(%r);"
+            "return a ? a.innerHTML : null;})()" % _WYSIWYG_ROOT_ID
+        )
+
+        def _cb(html) -> None:
+            if not isinstance(html, str):
+                return  # 페이지 미준비/실패 → 무시.
+            self._ingest_wysiwyg_html(html)  # 변화 시에만 _doc_text/dirty.
+            if final and self._view_mode in (MODE_EDITOR, MODE_SPLIT):
+                self._sync_editor_from_doc()  # 편집기에 최신 _doc_text 반영(보정).
+
+        try:
+            self.view.page().runJavaScript(js_get, 0, _cb)
+        except Exception:
+            pass
+
+    def _ingest_wysiwyg_html(self, html: str) -> None:
+        """편집 컨테이너 innerHTML 을 받아 '변화가 있을 때만' _doc_text/dirty 갱신.
+
+        ★ 베이스라인(_wysiwyg_last_html)과 비교해 프로그램적 setHtml(진입) 직후의
+           무변화를 사용자 편집으로 오인하지 않는다(dirty 오염·무한 동기화 방지).
+        ★ WYSIWYG 는 webview 를 재렌더하지 않는다 → _doc_text 만 갱신(커서 보존).
+           절대 _render_doc/_set_document/setHtml/_populate_toc 를 호출하지 않는다.
+        """
+        if self._wysiwyg_last_html is None:
+            # 아직 베이스라인 미설정(진입 셋업 콜백 전) → 이번 값을 베이스라인으로만.
+            self._wysiwyg_last_html = html
+            return
+        if html == self._wysiwyg_last_html:
+            return  # 변화 없음 → no-op(루프/비용 차단).
+        self._wysiwyg_last_html = html  # 새 베이스라인.
+        md = html_to_markdown(html)  # core 호출(항상 str, 예외 비전파).
+        self._doc_text = md
+        self._set_dirty(True)  # 사용자 편집 = 미저장 표시.
 
     # ------------------------------------------------------------------ #
     # 편집기 ↔ _doc_text 동기화 + 라이브 프리뷰 디바운스
@@ -646,6 +1010,8 @@ class MainWindow(QMainWindow):
 
     def _commit_editor_to_preview(self) -> None:
         """디바운스 만료 시: 편집기 내용을 _doc_text 에 반영하고 프리뷰 재렌더."""
+        if self._wysiwyg_active:
+            return  # WYSIWYG 에선 소스 편집기 숨김(방어적 — textChanged 안 옴).
         self._doc_text = self.editor.toPlainText()
         self._render_doc(preserve_scroll=True)
 
@@ -688,16 +1054,49 @@ class MainWindow(QMainWindow):
         # 미저장 변경 가드(붙여넣기로 현재 문서를 덮어쓰기 전).
         if not self._maybe_discard():
             return
+        # 문서 교체 → WYSIWYG 라이브 편집을 빠져나온다(scratch 는 일반 렌더, §4.6).
+        self._leave_wysiwyg_for_document_change()
         self._set_scratch(text)
 
     # ------------------------------------------------------------------ #
     # 저장 — Ctrl+S(저장) / Ctrl+Shift+S(다른 이름으로 저장)
     # ------------------------------------------------------------------ #
     def save(self) -> bool:
-        """Ctrl+S: scratch 면 Save As, 파일연결이면 같은 경로에 바로 저장."""
+        """Ctrl+S: scratch 면 Save As, 파일연결이면 같은 경로에 바로 저장.
+
+        WYSIWYG 활성 중에는 최신 innerHTML 을 먼저 캡처(비동기)한 뒤 저장한다 —
+        마지막 타이핑 직후 저장해도 폴링 tick 전 유실되지 않도록(§4.4).
+        """
+        if self._wysiwyg_active:
+            self._save_after_wysiwyg_capture()
+            return True  # 비동기 — 반환값은 best-effort.
         if self._path is None:
             return self.save_as()
         return self._write_to(self._path)
+
+    def _save_after_wysiwyg_capture(self) -> None:
+        """WYSIWYG 최신 편집을 캡처해 _doc_text 확정 후 저장(비동기, §4.4)."""
+        js_get = (
+            "(function(){var a=document.getElementById(%r);"
+            "return a ? a.innerHTML : null;})()" % _WYSIWYG_ROOT_ID
+        )
+
+        def _do_write() -> None:
+            if self._path is None:
+                self.save_as()
+            else:
+                self._write_to(self._path)
+
+        def _cb(html) -> None:
+            if isinstance(html, str):
+                self._ingest_wysiwyg_html(html)  # _doc_text 최신화(변화 시 dirty).
+            _do_write()
+
+        try:
+            self.view.page().runJavaScript(js_get, 0, _cb)
+        except Exception:
+            # 캡처 실패 시에도 현재 _doc_text 로 저장(폴링이 잡아둔 최신).
+            _do_write()
 
     def save_as(self) -> bool:
         """Ctrl+Shift+S: 항상 파일 대화상자. *.md 기본, 확장자 없으면 .md 보정."""
@@ -749,7 +1148,24 @@ class MainWindow(QMainWindow):
             | QMessageBox.StandardButton.Cancel,
         )
         if btn == QMessageBox.StandardButton.Save:
-            return self.save()  # 저장 성공 시에만 진행
+            # ★ WYSIWYG 활성 시 save() 는 비동기(캡처 콜백 안에서 write). 이 가드는
+            #   호출 직후 문서 교체(open/paste/reload)나 종료가 이어질 수 있으므로,
+            #   비동기 write 가 옛 _path/_doc_text 로 끝나도록 짧게 이벤트 루프를 돌려
+            #   캡처+쓰기를 안착시킨 뒤 진행한다(데이터 안전).
+            if self._wysiwyg_active:
+                self.save()  # 캡처+쓰기 예약(비동기).
+                try:
+                    from PySide6.QtCore import QCoreApplication, QEventLoop
+
+                    for _ in range(20):  # 최대 ~200ms.
+                        QCoreApplication.processEvents(
+                            QEventLoop.ProcessEventsFlag.AllEvents, 10
+                        )
+                except Exception:
+                    pass
+                # 쓰기 성공 시 _dirty=False 가 되어 있어야 진행 허용.
+                return not self._dirty
+            return self.save()  # 저장 성공 시에만 진행(동기 경로)
         if btn == QMessageBox.StandardButton.Discard:
             return True
         return False  # Cancel
@@ -784,7 +1200,12 @@ class MainWindow(QMainWindow):
 
         base_dir 은 _path 가 있으면 그 부모, scratch 면 _scratch_base_dir().
         테마 전환·붙여넣기 직후처럼 디스크 재독이 불필요한 경로에서 사용.
+
+        ★ WYSIWYG 라이브 편집 중엔 역렌더 금지(커서/선택/스크롤 보존). 진입 시의
+          1회 setHtml 은 _enter_wysiwyg 가 직접 수행하므로 이 게이트를 거치지 않는다.
         """
+        if self._wysiwyg_active:
+            return
         base_dir = self._path.parent if self._path else self._scratch_base_dir()
         result = render(self._doc_text, base_dir=base_dir)  # 예외 안 던짐(계약)
 
@@ -805,6 +1226,8 @@ class MainWindow(QMainWindow):
             return False
         if self._dirty and not self._maybe_discard():
             return False  # 사용자가 취소 → reload 중단(편집 내용 보호)
+        # 문서 재독 → WYSIWYG 라이브 편집을 빠져나온다(일반 렌더로 복귀, §4.6).
+        self._leave_wysiwyg_for_document_change()
         self._clear_external_change_banner()
         # _load_from_disk 내부에서 _sync_editor_from_doc 호출됨(편집기 동기화).
         return self._load_from_disk(preserve_scroll=True)
@@ -859,6 +1282,10 @@ class MainWindow(QMainWindow):
                 self.view.page().runJavaScript(f"window.scrollTo({x}, {y});")
             except Exception:
                 pass
+        # WYSIWYG 진입 셋업(페이지 로드 완료 후에만 DOM 조작 가능 — §2.2).
+        if ok and self._wysiwyg_pending_setup:
+            self._wysiwyg_pending_setup = False
+            self._activate_editable_then_baseline()
 
     # ------------------------------------------------------------------ #
     # 파일 변경 콜백 (메인 스레드) — 편집↔감시 충돌 정책
@@ -888,6 +1315,11 @@ class MainWindow(QMainWindow):
             return
         # 가드 B: 디스크 내용이 이미 _doc_text 와 같으면 reload 불필요(self-write 잔향).
         if disk_text == self._doc_text:
+            return
+
+        # 가드 C: WYSIWYG 라이브 편집 중이면 무조건 배너만(편집 surface 덮어쓰기 금지).
+        if self._wysiwyg_active:
+            self._show_external_change_banner()
             return
 
         if self._dirty:
@@ -953,6 +1385,33 @@ class MainWindow(QMainWindow):
     def toggle_theme(self) -> None:
         self._theme = theme_mod.toggle_theme(self._theme)
         self.settings.set_theme(self._theme)
+        # WYSIWYG 중 테마 전환: 최신 편집을 _doc_text 로 확정한 뒤 새 테마로 재진입
+        # (CSS 교체엔 setHtml 재호출이 필요하나 편집 DOM 을 덮으므로 flush→재진입).
+        # 캡처가 비동기라 콜백 안에서 _enter_wysiwyg 를 호출해 옛 _doc_text 경합 제거(§4.5).
+        if self._wysiwyg_active:
+            self._wysiwyg_poll.stop()
+            js_get = (
+                "(function(){var a=document.getElementById(%r);"
+                "return a ? a.innerHTML : null;})()" % _WYSIWYG_ROOT_ID
+            )
+
+            def _cb(html) -> None:
+                if isinstance(html, str):
+                    self._ingest_wysiwyg_html(html)  # _doc_text 최신화(변화 시 dirty).
+                self._wysiwyg_active = False  # 게이트 잠시 내려 재진입 허용.
+                self._enter_wysiwyg()  # render(_doc_text)→editable(새 테마).
+
+            try:
+                self.view.page().runJavaScript(js_get, 0, _cb)
+            except Exception:
+                self._wysiwyg_active = False
+                self._enter_wysiwyg()
+            self.statusBar().showMessage(
+                f"테마: {'다크' if self._theme == theme_mod.DARK else '라이트'}"
+                " (라이브 편집 — 커서가 문서 처음으로 이동할 수 있음)",
+                2500,
+            )
+            return
         # 문서가 있으면(파일/scratch 무관) CSS 만 교체해 다시 감싸 렌더(디스크 재독 없음).
         # 문서가 없으면(초기 상태) 환영 화면만 테마 반영.
         if self._path is not None or self._doc_text:
@@ -1014,15 +1473,31 @@ class MainWindow(QMainWindow):
             "<p style='color:gray;font-size:0.85em'>"
             "단축키: Ctrl+O 열기 · Ctrl+Shift+V 붙여넣기 · "
             "Ctrl+S 저장 · Ctrl+Shift+S 다른 이름으로 저장 · "
-            "Ctrl+1 / Ctrl+2 / Ctrl+3 편집기 / 미리보기 / 분할 · "
+            "Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+4 편집기 / 미리보기 / 분할 / 라이브 편집 · "
             "Ctrl+R 새로고침 · Ctrl+T 테마 · "
-            "Ctrl+= / Ctrl+- / Ctrl+0 줌 · F11 전체화면 · Ctrl+\\ 목차</p>",
+            "Ctrl+= / Ctrl+- / Ctrl+0 줌 · F11 전체화면 · Ctrl+\\ 목차</p>"
+            "<p style='color:gray;font-size:0.82em'>"
+            "라이브 편집(WYSIWYG): 미리보기에서 직접 서식을 적용하며 편집합니다. "
+            "마크다운 소스가 정규화될 수 있습니다(내용은 보존).</p>",
         )
 
     # ------------------------------------------------------------------ #
     # 종료 정리
     # ------------------------------------------------------------------ #
     def closeEvent(self, event) -> None:  # noqa: N802
+        # WYSIWYG 활성 시: 마지막 편집을 _doc_text 로 확정(폴링 캡처는 비동기라 종료
+        # 직전 누락 위험). 이탈 캡처를 쏘고 짧게 이벤트 루프를 돌려 콜백을 안착시킨다
+        # → 이후 _maybe_discard 의 Save 가 최신 _doc_text 를 쓴다(데이터 안전).
+        if self._wysiwyg_active:
+            self._exit_wysiwyg()  # 폴링 stop + final 캡처(비동기 콜백 예약).
+            try:
+                from PySide6.QtCore import QCoreApplication
+                from PySide6.QtCore import QEventLoop as _QEL
+
+                for _ in range(20):  # 최대 ~200ms, runJavaScript 콜백 안착 대기.
+                    QCoreApplication.processEvents(_QEL.ProcessEventsFlag.AllEvents, 10)
+            except Exception:
+                pass
         # 미저장 변경 가드(데이터 유실 방지) — 취소 시 종료 중단.
         if not self._maybe_discard():
             event.ignore()

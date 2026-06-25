@@ -26,7 +26,8 @@ MAX_RECENT = 10
 
 # 뷰 모드 리터럴 — main_window.MODE_* 와 반드시 동일해야 한다.
 # (settings 는 main_window 를 import 하지 않는다 — 순환 import 회피.)
-_VALID_VIEW_MODES = ("editor", "preview", "split")
+# "wysiwyg"(Phase 8 라이브 편집) 추가. 키/메서드는 무변경(기존 view/mode 재사용).
+_VALID_VIEW_MODES = ("editor", "preview", "split", "wysiwyg")
 _DEFAULT_VIEW_MODE = "preview"
 
 
