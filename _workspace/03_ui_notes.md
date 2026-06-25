@@ -1,6 +1,47 @@
 # UI 구현 노트 (ui-dev)
 
-> 작성: ui-dev · 2026-06-01 · 갱신: 2026-06-25(Phase 9 워드프로세서 UI: 새 문서 + 단축 버튼 툴바 + 통합 서식) · 대상: QA / packager / core-engine-dev
+> 작성: ui-dev · 2026-06-01 · 갱신: 2026-06-25(Phase 10 표 삽입 + 행/열 편집) · 대상: QA / packager / core-engine-dev
+
+## 0-D. Phase 10 변경 요약 (표 삽입 + 행/열 편집 — 양 편집 surface)
+
+설계서: `_workspace/10_table_feature_design.md`(계약, 그대로 구현). **소유권 준수**: `main_window.py` **단일 파일**만 수정. `renderer.py`/`settings.py`/`theme.py`/`file_watcher.py`/`requirements.txt`/`mdviewer.spec` **무변경**(core/settings/theme 변경 0, 신규 JS 자산 0). 모듈 상단 import 추가: `from dataclasses import dataclass, field`. 모듈 상수 추가: `_PIPE_LINE_RE`, `_SEP_CELL_RE`, `_TABLE_DEFAULT_ROWS=2`, `_TABLE_DEFAULT_COLS=2`, `_WYSIWYG_TABLE_OP_JS`(파이썬 문자열 리터럴, op 를 `%s` 로 주입).
+
+**(1) 통합 디스패치 확장(기존 패턴 그대로)** — 신규 의미 슬롯 → 디스패처 → surface 분기. surface 판별은 기존 `_is_wysiwyg_surface`/`_is_source_editor_surface`/`_is_edit_surface` **재사용**(신규 판별 0).
+  - 의미 슬롯: `fmt_table()` / `fmt_table_row_add()` / `fmt_table_row_del()` / `fmt_table_col_add()` / `fmt_table_col_del()`.
+  - 디스패처: `_dispatch_table_insert()`(공통 행×열 다이얼로그 → surface 분기) / `_dispatch_table_op(op)`(`op∈{row_add,row_del,col_add,col_del}` → surface 분기).
+  - 다이얼로그: `QInputDialog.getInt` 2회(행 본문수 기본 2/min 1/max 50, 열 기본 2/min 1/max 20). 둘 중 취소 시 전체 중단.
+
+**(2) ★ 순수 함수(GUI 비의존 — QA 가 GUI 없이 단위 테스트)** — `main_window.py` 모듈 수준. import 경로: `from mdviewer.main_window import ...`.
+  - `@dataclass TableBlock(top:int, bottom:int, header:list, aligns:list, body:list[list], ncols:int)`.
+  - `build_gfm_table_skeleton(rows:int, cols:int) -> str` : 헤더 `열1..`, 구분행 `---`, 빈 본문행 rows 개. 양끝 파이프·균일 폭. rows/cols 최소 1 강제.
+  - `_split_table_cells(line:str) -> list[str]` : strip→양끝 파이프 제거→`|` split→각 셀 strip.
+  - `_is_separator_row(cells:list) -> bool` : 모든 셀이 `^:?-{1,}:?$` 인가.
+  - `parse_table_lines(top:int, bottom:int, lines:list[str]) -> TableBlock|None` : 최소 2줄+구분행(index1) 필수, 없으면 None. ncols=헤더 셀 수, 본문/구분 사각형화(부족=빈셀, 초과=절단).
+  - `render_table_block(tb:TableBlock) -> str` : 양끝 파이프·열폭 균일맞춤(`len()` 기반)·구분행 정렬 콜론 보존 재구성.
+  - `apply_table_op(tb:TableBlock, op:str, line_idx:int, col_idx:int) -> bool` : in-place 변형. **거부=False**(row_del: 본문 1행뿐/헤더·구분행 커서 / col_del: 1열뿐). line_idx 0=헤더,1=구분,2..=본문. col_idx 범위밖=맨끝 보정.
+  - `cursor_col_index(line_text:str, pos_in_block:int, ncols:int) -> int` : 커서 위치가 몇 번째 셀 구간인지(파이프 경계 기반, 0..ncols-1 클램프).
+
+**(3) 소스 편집기(Editor/Split) 경로** — GUI 헬퍼(순수 함수 호출):
+  - `_editor_insert_table(rows, cols)` : `build_gfm_table_skeleton` 삽입(beginEditBlock=undo 1스텝). 커서가 줄 중간/비빈 줄이면 표 앞 `\n` 보정(표는 블록). 삽입 후 헤더 첫 셀(`열1`)을 선택 상태로(바로 덮어쓰기). dirty/렌더는 `textChanged`→디바운스 자동.
+  - `_find_table_block() -> TableBlock|None` : 커서 줄 포함 연속 파이프 라인(비어있지 않은) 위/아래 확장 → `parse_table_lines`. 표 밖/구분행 없으면 None.
+  - `_editor_table_op(op)` : `_find_table_block`→`cursor_col_index`→`apply_table_op`→`render_table_block`→`_replace_table_block`. None/거부 시 **상태바 안내**(크래시 없음).
+  - `_replace_table_block(tb, new_text)` : `[tb.top, tb.bottom]` 블록 범위 선택 치환(beginEditBlock=undo 1스텝). 커서는 표 시작 부근 best-effort.
+
+**(4) WYSIWYG 경로** — DOM 직접 조작(JS 리터럴, 신규 자산 0):
+  - `_wysiwyg_insert_table(rows, cols)` : 빈 `<table class='md-table'>`(thead/tbody, 셀=`&nbsp;`) + 뒤 `<p>` 를 `_exec_format("insertHTML", html)`(기존 래퍼 → 자동 캡처). 라운드트립: `html_to_markdown`→파이프표→`_doc_text`.
+  - `_wysiwyg_table_op(op)` : `_WYSIWYG_TABLE_OP_JS % op` 단일 IIFE 실행(selection anchor→`closest('td,th')`→tr/table/colIndex→row_add 아래 tr / row_del 헤더·본문1행 거부 / col_add 모든 행 colIndex 다음(thead=th,tbody=td) / col_del 1열 거부) → `_capture_wysiwyg_once(final=False)`. 병합셀 미지원. 거부=조용한 no-op(비동기라 파이썬 안내 어려움 — §c 정책).
+
+**(5) 서식 툴바 표 그룹** — `_build_format_toolbar` 끝(링크/서식지우기 다음)에 `addSeparator()` 후 `[표][행+][행−][열+][열−]`(기존 `_mk_fmt` 헬퍼, 텍스트 라벨+툴팁). 게이팅은 서식 툴바 포함이라 `_apply_view_mode` 의 `edit_surface` 가시성으로 **자동**(Preview 숨김) — 추가 게이팅 코드 0.
+
+**(6) About 안내 1줄** : "표: 편집기/분할에선 GFM 파이프표로 정확히 편집되고, 라이브 편집(WYSIWYG)에선 정렬/병합셀이 단순화될 수 있습니다 — 정밀 표 작업은 편집기/분할을 권장합니다."
+
+**라운드트립 한계(QA/문서)**: ① WYSIWYG 표 정렬(`text-align` 미부여)→라운드트립 시 정렬 콜론 미생성(기본 좌측). Editor 삽입도 v1 정렬 미지정(편집 시 콜론은 보존). ② 병합셀(rowspan/colspan) v1 미생성/미지원(단순 사각 표만). ③ WYSIWYG html2text 출력은 양끝 파이프·셀 공백·구분선 폭이 정규화(내용 보존). ④ 셀 내 리터럴 파이프(`\|`)·셀 내 줄바꿈/블록요소 v1 미지원. ⑤ **Editor 경로는 결정적 GFM**(파서 자체 재구성) — 라운드트립 손실 없음. 정밀 표 작업은 Editor/Split 권장.
+
+**검증**: ast.parse OK. 순수 함수 12케이스(골격/파싱/round-trip 안정/row·col add·del/거부 3종/cursor_col_index/정렬보존/구분행없음→None) PASS. offscreen 스모크: Editor 삽입→`_doc_text` GFM·render `<table>`, 표안 행/열 add·del→블록 갱신, 표밖 op→안내(크래시 없음), WYSIWYG 삽입→`_doc_text` 파이프표·행/열 JS 예외 없음, 게이팅(Preview 숨김/Split 표시) 모두 PASS.
+
+**계약 변경 없음** — core/settings/theme/spec/requirements 무변경, 설계 §9 그대로.
+
+---
 
 ## 0-C. Phase 9 변경 요약 (새 문서 + 워드프로세서식 툴바 + Undo/Redo + 통합 서식 디스패치)
 

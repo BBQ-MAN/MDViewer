@@ -9,6 +9,7 @@ __app_name__ = "MDViewer"
 __author__ = "Lectus"
 
 # 코어 공개 심볼(비-GUI). UI/QA 가 `from mdviewer import render, ...` 로 사용.
+from mdviewer.exporter import markdown_to_docx
 from mdviewer.file_watcher import FileWatcher
 from mdviewer.renderer import (
     RenderResult,
@@ -32,6 +33,8 @@ __all__ = [
     "RenderResult",
     "TocItem",
     "pygments_css",
+    # Word(.docx) 내보내기 (PDF 는 UI 전용이라 미노출)
+    "markdown_to_docx",
     # 파일 감시
     "FileWatcher",
 ]

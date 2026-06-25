@@ -21,9 +21,10 @@ from __future__ import annotations
 
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QMarginsF, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -31,6 +32,8 @@ from PySide6.QtGui import (
     QGuiApplication,
     QIcon,
     QKeySequence,
+    QPageLayout,
+    QPageSize,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -45,7 +48,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStyle,
 )
-from PySide6.QtWebEngineCore import QWebEngineSettings
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from . import paths, theme as theme_mod
@@ -110,6 +113,26 @@ except Exception:
     _WATCHER_AVAILABLE = False
     FileWatcher = None  # type: ignore
 
+# ---- Word(.docx) 내보내기 코어(Phase 10) — 없으면 graceful 폴백(설계 §9.3) ----
+# exporter.py 가 아직 없을 수 있으므로(병렬 개발) import 를 graceful 하게 처리한다.
+# PDF 내보내기는 core 무관(printToPdf 는 UI 전용)이라 이 분기와 독립적으로 동작한다.
+try:  # pragma: no cover - 통합 시점에 따라 분기
+    from .exporter import markdown_to_docx  # type: ignore
+    _EXPORT_AVAILABLE = True
+except Exception:
+    _EXPORT_AVAILABLE = False
+
+    def markdown_to_docx(  # type: ignore
+        markdown_text: str, out_path: Path, base_dir: Path, *, title: str | None = None
+    ) -> None:
+        """코어 미연결 폴백: 호출 시 OSError 를 던져 UI 가 안내하도록 한다.
+
+        실제 시그니처는 exporter.markdown_to_docx(md, path, base_dir, *, title=None).
+        _EXPORT_AVAILABLE 가 False 면 act_export_docx 는 항상 비활성이라 정상 경로로는
+        여기 도달하지 않으나, 방어적으로 OSError(저장 실패 계열) 를 전파한다.
+        """
+        raise OSError("Word 내보내기 모듈(exporter.py)이 아직 연결되지 않았습니다.")
+
 _MD_FILTER = "Markdown (*.md *.markdown *.mdown *.mkd);;모든 파일 (*.*)"
 _RELOAD_DEBOUNCE_MS = 120
 _ZOOM_MIN = 0.4
@@ -134,6 +157,52 @@ _WYSIWYG_POLL_MS = 400
 # contentEditable 컨테이너 element id(진입 JS 가 article.markdown-body 에 런타임 부여).
 _WYSIWYG_ROOT_ID = "md-editable"
 
+# WYSIWYG 표 행/열 DOM 조작 JS(파이썬 문자열 리터럴, 신규 자산 0). op 를 %s 로 주입.
+# selection anchor → closest('td,th') → tr/table/colIndex → row/col 조작.
+# 병합셀(rowspan/colspan) 미지원(단순 사각 표만 안전). 빈 표 방지(거부=조용한 no-op).
+_WYSIWYG_TABLE_OP_JS = """
+(function(){
+  var sel = window.getSelection();
+  if(!sel || sel.rangeCount===0) return;
+  var node = sel.anchorNode;
+  var cell = node && (node.nodeType===1 ? node : node.parentElement);
+  cell = cell && cell.closest ? cell.closest('td,th') : null;
+  if(!cell) return;
+  var row = cell.parentElement;
+  var table = cell.closest('table');
+  if(!table) return;
+  var colIndex = Array.prototype.indexOf.call(row.cells, cell);
+  var op = '%s';
+  function newCell(tag){ var c=document.createElement(tag); c.innerHTML='&nbsp;'; return c; }
+  if(op==='row_add'){
+    var clone = document.createElement('tr');
+    for(var i=0;i<row.cells.length;i++) clone.appendChild(newCell('td'));
+    row.parentElement.insertBefore(clone, row.nextSibling);
+  } else if(op==='row_del'){
+    var inThead = row.parentElement.tagName==='THEAD';
+    var tbody = table.tBodies[0];
+    if(inThead) return;
+    if(tbody && tbody.rows.length<=1) return;
+    row.parentElement.removeChild(row);
+  } else if(op==='col_add'){
+    var allRows = table.rows;
+    for(var r=0;r<allRows.length;r++){
+      var rr=allRows[r];
+      var tag = (rr.parentElement.tagName==='THEAD') ? 'th' : 'td';
+      var ref = rr.cells[colIndex] ? rr.cells[colIndex].nextSibling : null;
+      rr.insertBefore(newCell(tag), ref);
+    }
+  } else if(op==='col_del'){
+    if(table.rows[0] && table.rows[0].cells.length<=1) return;
+    var allRows2 = table.rows;
+    for(var r2=0;r2<allRows2.length;r2++){
+      var c2 = allRows2[r2].cells[colIndex];
+      if(c2) allRows2[r2].removeChild(c2);
+    }
+  }
+})()
+"""
+
 # ---- 통합 서식(Phase 9) — 소스 편집기 마크다운 마커/접두 ----
 # 인라인 마커(선택을 감싸 토글). 백틱은 코드.
 _INLINE_MARK = {"bold": "**", "italic": "*", "strike": "~~", "code": "`"}
@@ -143,6 +212,247 @@ _LINE_PREFIX = {"ul": "- ", "ol": "1. ", "quote": "> "}
 _HEADING_PREFIX = {1: "# ", 2: "## ", 3: "### "}
 # 기존 헤딩 접두 매칭(서식 토글/제거용).
 _HEADING_RE = re.compile(r"^(#{1,6}\s+)")
+
+# ---- 표(Phase 10) — 표블록 식별/구분행 정규식(모듈 상수) -------------------
+# 파이프 포함 라인 = 표 라인 후보(느슨한 식별; 재구성 시 양끝 파이프로 정규화).
+_PIPE_LINE_RE = re.compile(r"\|")
+# 구분행 셀(정렬 콜론 허용): ^:?-{1,}:?$ (공백 트림 후).
+_SEP_CELL_RE = re.compile(r"^:?-{1,}:?$")
+# 표 삽입 기본값(다이얼로그 초기값).
+_TABLE_DEFAULT_ROWS = 2
+_TABLE_DEFAULT_COLS = 2
+
+
+# ====================================================================== #
+# 표 — 순수 함수(GUI 비의존, QA 단위 테스트 대상). main_window 모듈 수준.
+#   파싱(_split_table_cells/_is_separator_row/parse_table_lines) →
+#   조작(apply_table_op) → 재구성(render_table_block) 의 round-trip 보장.
+# ====================================================================== #
+@dataclass
+class TableBlock:
+    """소스 편집기 GFM 표블록 모델(순수 데이터).
+
+    top/bottom : 표가 차지하는 blockNumber 범위(소스 편집기 라인 인덱스).
+    header     : 헤더 셀 텍스트 리스트.
+    aligns     : 구분행 셀 원형('---'/':--'/'--:'/':-:') — 정렬 보존.
+    body       : 본문 행들(각 행 = 셀 텍스트 리스트, ncols 로 사각형화).
+    ncols      : 열 수(헤더 기준).
+    """
+
+    top: int
+    bottom: int
+    header: list = field(default_factory=list)
+    aligns: list = field(default_factory=list)
+    body: list = field(default_factory=list)
+    ncols: int = 0
+
+
+def _split_table_cells(line: str) -> list:
+    """표 라인 한 줄을 셀 리스트로 분해(순수 함수).
+
+    strip → 양끝 파이프 제거 → '|' split → 각 셀 strip. 셀 내 리터럴
+    파이프('\\|') 는 v1 미지원(분리됨). 빈 라인은 빈 리스트.
+    """
+    s = (line or "").strip()
+    if not s:
+        return []
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _is_separator_row(cells: list) -> bool:
+    """셀들이 모두 구분행 셀(^:?-{1,}:?$)인가(빈 행은 False)."""
+    if not cells:
+        return False
+    return all(_SEP_CELL_RE.match(c.strip()) is not None for c in cells)
+
+
+def parse_table_lines(top: int, bottom: int, lines: list) -> "TableBlock | None":
+    """연속 표 라인(lines)을 파싱해 TableBlock 으로 변환(순수 함수).
+
+    규칙:
+      - 최소 2줄(헤더 + 구분행) 필요.
+      - 구분행은 헤더 바로 다음 줄(index 1)이어야 유효 GFM 표.
+      - ncols = 헤더 셀 수. 본문/구분은 ncols 로 사각형화(부족=빈셀, 초과=절단).
+    유효하지 않으면 None(행/열 편집 비활성 → 호출측이 안내).
+    """
+    if not lines or len(lines) < 2:
+        return None
+    header = _split_table_cells(lines[0])
+    if not header:
+        return None
+    sep_cells = _split_table_cells(lines[1])
+    if not _is_separator_row(sep_cells):
+        return None  # 구분행 없음 → 유효 GFM 표 아님.
+    ncols = len(header)
+
+    def _fit(cells: list) -> list:
+        cells = list(cells)
+        if len(cells) < ncols:
+            cells = cells + [""] * (ncols - len(cells))
+        elif len(cells) > ncols:
+            cells = cells[:ncols]
+        return cells
+
+    # 구분행 정렬 원형 보존(ncols 로 맞춤; 부족분은 기본 '---').
+    aligns = _fit(sep_cells)
+    aligns = [a if a else "---" for a in aligns]
+    body = [_fit(_split_table_cells(ln)) for ln in lines[2:]]
+    return TableBlock(top=top, bottom=bottom, header=header, aligns=aligns,
+                      body=body, ncols=ncols)
+
+
+def render_table_block(tb: "TableBlock") -> str:
+    """TableBlock 을 깔끔한 GFM 표 텍스트로 재구성(순수 함수).
+
+    양끝 파이프, 열 폭 = max(헤더/구분/본문 셀 len) 균일맞춤. 구분행은 정렬
+    원형(콜론)을 보존하며 폭에 맞춰 '-' 채움. ncols 사각형화(파서가 이미 보장).
+    """
+    ncols = tb.ncols
+    if ncols <= 0:
+        return ""
+
+    def _fit(cells: list) -> list:
+        cells = list(cells)
+        if len(cells) < ncols:
+            cells = cells + [""] * (ncols - len(cells))
+        return cells[:ncols]
+
+    header = _fit(tb.header)
+    aligns = _fit(tb.aligns)
+    body = [_fit(r) for r in tb.body]
+
+    # 열 폭 = 헤더/본문 셀 표시폭의 최대(구분행은 최소 3, len 기반 — §f 한계).
+    widths = []
+    for c in range(ncols):
+        w = len(header[c])
+        for r in body:
+            w = max(w, len(r[c]))
+        widths.append(max(w, 3))
+
+    def _row(cells: list) -> str:
+        return "| " + " | ".join(cells[i].ljust(widths[i]) for i in range(ncols)) + " |"
+
+    def _sep_cell(spec: str, width: int) -> str:
+        """정렬 원형(spec)의 콜론을 보존하며 width 길이로 '-' 채움."""
+        spec = (spec or "---").strip()
+        left = spec.startswith(":")
+        right = spec.endswith(":")
+        dashes = max(1, width - (1 if left else 0) - (1 if right else 0))
+        return ("" if not left else ":") + "-" * dashes + ("" if not right else ":")
+
+    sep_line = "| " + " | ".join(
+        _sep_cell(aligns[i], widths[i]) for i in range(ncols)
+    ) + " |"
+    lines = [_row(header), sep_line] + [_row(r) for r in body]
+    return "\n".join(lines)
+
+
+def apply_table_op(tb: "TableBlock", op: str, line_idx: int, col_idx: int) -> bool:
+    """TableBlock 을 in-place 변형(순수 로직). op 적용 성공이면 True, 거부면 False.
+
+    line_idx : 표 내 라인 인덱스(0=헤더, 1=구분, 2..=본문). 음수/범위밖이면 보정.
+    col_idx  : 표 내 열 인덱스(0-based). 범위밖이면 맨 끝으로 보정.
+    규칙(§b.3):
+      - row_add : 커서 본문행 아래 빈 행 삽입. 헤더/구분이면 본문 맨 위. 본문 없으면 1행.
+      - row_del : 커서 본문행 삭제. 본문 1행뿐이면 거부(False). 헤더/구분이면 거부.
+      - col_add : 커서 셀 오른쪽에 열 삽입(헤더='열N', 구분='---', 본문='').
+      - col_del : 커서 셀 열 삭제. 열 1개뿐이면 거부(False).
+    """
+    ncols = tb.ncols
+    body_idx = line_idx - 2  # 본문 인덱스(헤더=0,구분=1 → 본문 0..)
+    # 열 인덱스 보정(범위밖 → 맨 끝).
+    if col_idx < 0 or col_idx >= ncols:
+        col_idx = max(0, ncols - 1)
+
+    if op == "row_add":
+        new_row = [""] * ncols
+        if 0 <= body_idx < len(tb.body):
+            tb.body.insert(body_idx + 1, new_row)  # 아래 삽입.
+        else:
+            tb.body.insert(0, new_row)  # 헤더/구분/범위밖 → 본문 맨 위.
+        return True
+
+    if op == "row_del":
+        if body_idx < 0:
+            return False  # 헤더/구분행 → 거부(안내).
+        if len(tb.body) <= 1:
+            return False  # 본문 1행뿐 → 거부(빈 표 방지).
+        if body_idx >= len(tb.body):
+            body_idx = len(tb.body) - 1
+        del tb.body[body_idx]
+        return True
+
+    if op == "col_add":
+        at = col_idx + 1  # 오른쪽 삽입 위치.
+        tb.header.insert(at, f"열{ncols + 1}")
+        tb.aligns.insert(at, "---")
+        for r in tb.body:
+            r.insert(at, "")
+        tb.ncols = ncols + 1
+        return True
+
+    if op == "col_del":
+        if ncols <= 1:
+            return False  # 열 1개뿐 → 거부(빈 표 방지).
+        del tb.header[col_idx]
+        del tb.aligns[col_idx]
+        for r in tb.body:
+            if col_idx < len(r):
+                del r[col_idx]
+        tb.ncols = ncols - 1
+        return True
+
+    return False  # 알 수 없는 op.
+
+
+def build_gfm_table_skeleton(rows: int, cols: int) -> str:
+    """깔끔한 GFM 표 골격 텍스트 생성(순수 함수, 소스 편집기 삽입용).
+
+    헤더='열1'.. , 구분행='---'(좌측정렬), 빈 본문행 rows 개. 양끝 파이프·균일 폭.
+    rows/cols 최소 1 강제(빈 표 방지).
+    """
+    cols = max(1, int(cols))
+    rows = max(1, int(rows))
+    headers = [f"열{i + 1}" for i in range(cols)]
+    widths = [max(len(h), 3) for h in headers]
+
+    def _row(cells: list) -> str:
+        return "| " + " | ".join(cells[i].ljust(widths[i]) for i in range(cols)) + " |"
+
+    header_line = _row(headers)
+    sep_line = "| " + " | ".join("-" * widths[i] for i in range(cols)) + " |"
+    body_lines = [_row([""] * cols) for _ in range(rows)]
+    return "\n".join([header_line, sep_line] + body_lines)
+
+
+def cursor_col_index(line_text: str, pos_in_block: int, ncols: int) -> int:
+    """줄 텍스트에서 커서 위치(pos_in_block)가 몇 번째 셀 구간인지 계산(순수 함수).
+
+    파이프('|') 위치들을 경계로, pos 가 속한 구간 인덱스를 반환. 양끝 파이프를
+    고려해 0..ncols-1 로 클램프. 파이프가 없으면 0.
+    """
+    line_text = line_text or ""
+    pipes = [i for i, ch in enumerate(line_text) if ch == "|"]
+    if not pipes:
+        return 0
+    # 양끝 파이프 기준 셀 구간: (pipe[k], pipe[k+1]) 사이 = 셀 k. 선행 파이프
+    # 앞 텍스트(보통 공백)는 셀 0 으로 간주.
+    seg = 0
+    for p in pipes:
+        if pos_in_block <= p:
+            break
+        seg += 1
+    # 선행 파이프가 있으면 seg 는 1-based(파이프 1개 지나면 셀0) → 1 빼서 0-based.
+    idx = seg - 1 if line_text.lstrip().startswith("|") else seg
+    if idx < 0:
+        idx = 0
+    if ncols > 0 and idx > ncols - 1:
+        idx = ncols - 1
+    return idx
 
 
 class _WatchBridge(QObject):
@@ -159,6 +469,10 @@ class MainWindow(QMainWindow):
         self._doc_text: str = ""          # 현재 표시 중인 마크다운 소스(렌더 입력원)
         self._path: Path | None = None    # 연결된 파일(None = scratch 임시 문서)
         self._dirty: bool = False         # 마지막 저장 이후 변경 여부
+        self._doc_title: str | None = None  # 직전 렌더의 제목(첫 h1) — 내보내기 기본명용
+        # ---- PDF 내보내기 상태(Phase 10) — 오프스크린 비동기 생명주기 ----
+        self._pdf_page: QWebEnginePage | None = None  # 오프스크린 페이지(GC 방지 필수)
+        self._pdf_busy: bool = False                  # 인쇄 진행 중 재진입 가드
         self._theme = self.settings.theme()
         self._zoom = self.settings.zoom()
         self._pending_scroll: tuple[float, float] | None = None
@@ -335,6 +649,19 @@ class MainWindow(QMainWindow):
         self.act_save_as.setToolTip("다른 이름으로 저장 (Ctrl+Shift+S)")
         self.act_save_as.triggered.connect(self.save_as)
 
+        # ---- 내보내기(Phase 10) — PDF/Word. 단축키 없음(메뉴/툴바 클릭 전용). ----
+        self.act_export_pdf = QAction("PDF로 내보내기...", self)
+        self.act_export_pdf.setToolTip("PDF로 내보내기")
+        self.act_export_pdf.setIcon(st.standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+        self.act_export_pdf.triggered.connect(self.export_pdf)
+
+        self.act_export_docx = QAction("Word(.docx)로 내보내기...", self)
+        self.act_export_docx.setToolTip("Word 문서로 내보내기")
+        self.act_export_docx.triggered.connect(self.export_docx)
+        # 코어 미연결이면 Word 내보내기 자체가 불가 → 영구 비활성(PDF 는 영향 없음).
+        if not _EXPORT_AVAILABLE:
+            self.act_export_docx.setEnabled(False)
+
         self.act_exit = QAction("종료", self)
         self.act_exit.setShortcut(QKeySequence.StandardKey.Quit)
         self.act_exit.triggered.connect(self.close)
@@ -451,6 +778,10 @@ class MainWindow(QMainWindow):
         m_file.addAction(self.act_paste)
         m_file.addAction(self.act_save)
         m_file.addAction(self.act_save_as)
+        # 내보내기 서브메뉴(PDF/Word) — 저장 그룹 아래, 첫 separator 앞(설계 §4.2).
+        self.menu_export = m_file.addMenu("내보내기(&E)")
+        self.menu_export.addAction(self.act_export_pdf)
+        self.menu_export.addAction(self.act_export_docx)
         m_file.addSeparator()
         m_file.addAction(self.act_reload)
         m_file.addSeparator()
@@ -499,6 +830,9 @@ class MainWindow(QMainWindow):
         # [편집]
         tb.addAction(self.act_undo)
         tb.addAction(self.act_redo)
+        tb.addSeparator()
+        # [내보내기] PDF 1개만(Word 는 메뉴 전용 — 툴바 혼잡도 관리, 설계 §4.3).
+        tb.addAction(self.act_export_pdf)
         tb.addSeparator()
         # [보기] 모드 4종(QActionGroup 라디오)
         tb.addAction(self.act_mode_editor)
@@ -566,6 +900,29 @@ class MainWindow(QMainWindow):
         )
         tb.addAction(self.act_fmt_link)
         tb.addAction(self.act_fmt_clear)
+        tb.addSeparator()
+        # 표(Phase 10) — 삽입 + 행/열 편집(양 편집 surface 분기). 텍스트 라벨(자산 0).
+        self.act_fmt_table = self._mk_fmt("표", self.fmt_table, "표 삽입(행×열)")
+        self.act_fmt_row_add = self._mk_fmt(
+            "행+", self.fmt_table_row_add, "행 추가(커서 행 아래)"
+        )
+        self.act_fmt_row_del = self._mk_fmt(
+            "행−", self.fmt_table_row_del, "행 삭제(커서 행)"
+        )
+        self.act_fmt_col_add = self._mk_fmt(
+            "열+", self.fmt_table_col_add, "열 추가(커서 열 오른쪽)"
+        )
+        self.act_fmt_col_del = self._mk_fmt(
+            "열−", self.fmt_table_col_del, "열 삭제(커서 열)"
+        )
+        for a in (
+            self.act_fmt_table,
+            self.act_fmt_row_add,
+            self.act_fmt_row_del,
+            self.act_fmt_col_add,
+            self.act_fmt_col_del,
+        ):
+            tb.addAction(a)
 
         # B/I 강조(툴바 위젯에 스타일 — 외부 자산 0, ui-dev 재량).
         try:
@@ -671,6 +1028,52 @@ class MainWindow(QMainWindow):
             self._editor_clear()  # v1: 안내(설계 §5.5 — 게이팅으로 보통 비활성)
 
     # ------------------------------------------------------------------ #
+    # (표) 의미 슬롯 + 디스패처 — 삽입/행열편집(Phase 10, 설계 §a/§b/§c/§e)
+    # ------------------------------------------------------------------ #
+    def fmt_table(self) -> None:
+        """서식 툴바 "표" 버튼 → 행×열 입력 후 활성 surface 로 삽입 분기."""
+        self._dispatch_table_insert()
+
+    def fmt_table_row_add(self) -> None:
+        self._dispatch_table_op("row_add")
+
+    def fmt_table_row_del(self) -> None:
+        self._dispatch_table_op("row_del")
+
+    def fmt_table_col_add(self) -> None:
+        self._dispatch_table_op("col_add")
+
+    def fmt_table_col_del(self) -> None:
+        self._dispatch_table_op("col_del")
+
+    def _dispatch_table_insert(self) -> None:
+        """행×열 다이얼로그(공통 진입) → 활성 surface 로 삽입. 취소 시 전체 중단."""
+        if not self._is_edit_surface():
+            return  # Preview → no-op(툴바 숨김, 방어적).
+        rows, ok = QInputDialog.getInt(
+            self, "표 삽입", "행 수(본문):", _TABLE_DEFAULT_ROWS, 1, 50, 1
+        )
+        if not ok:
+            return
+        cols, ok = QInputDialog.getInt(
+            self, "표 삽입", "열 수:", _TABLE_DEFAULT_COLS, 1, 20, 1
+        )
+        if not ok:
+            return
+        if self._is_wysiwyg_surface():
+            self._wysiwyg_insert_table(rows, cols)   # JS insertHTML(§a.3)
+        elif self._is_source_editor_surface():
+            self._editor_insert_table(rows, cols)    # GFM 골격(§a.2)
+
+    def _dispatch_table_op(self, op: str) -> None:
+        """행/열 조작을 활성 surface 로 분기(§e)."""
+        if self._is_wysiwyg_surface():
+            self._wysiwyg_table_op(op)               # DOM JS(§c)
+        elif self._is_source_editor_surface():
+            self._editor_table_op(op)                # 표블록 파싱·재구성(§b)
+        # Preview → no-op(툴바 숨김, 방어적).
+
+    # ------------------------------------------------------------------ #
     # (a) WYSIWYG 경로 — 기존 execCommand 동작(래퍼만, 동작 무변경)
     # ------------------------------------------------------------------ #
     def _exec_format(self, command: str, value: str | None = None) -> None:
@@ -741,6 +1144,41 @@ class MainWindow(QMainWindow):
             return
         self._exec_format("removeFormat")
         self._exec_format("formatBlock", "P")
+
+    def _wysiwyg_insert_table(self, rows: int, cols: int) -> None:
+        """WYSIWYG editable 에 빈 <table>(thead/tbody) 삽입(insertHTML) 후 캡처(§a.3).
+
+        빈 td/th 는 클릭영역 확보 위해 &nbsp; 1개. 표 뒤 <p> 로 이어쓸 단락 확보.
+        _exec_format 가 삽입 직후 _capture_wysiwyg_once 를 자동 호출(폴링 보조).
+        """
+        if not self._wysiwyg_active:
+            return
+        cols = max(1, int(cols))
+        rows = max(1, int(rows))
+        th = "".join("<th>&nbsp;</th>" for _ in range(cols))
+        td = "".join("<td>&nbsp;</td>" for _ in range(cols))
+        body = "".join("<tr>" + td + "</tr>" for _ in range(rows))
+        html = (
+            "<table class='md-table'><thead><tr>" + th + "</tr></thead>"
+            "<tbody>" + body + "</tbody></table><p>&nbsp;</p>"
+        )
+        self._exec_format("insertHTML", html)        # 기존 래퍼 재사용(캡처 포함).
+
+    def _wysiwyg_table_op(self, op: str) -> None:
+        """WYSIWYG DOM 행/열 조작(JS) 후 캡처(§c).
+
+        표 밖/빈표 거부는 JS 가 조용히 no-op(비동기라 파이썬 안내 어려움 — §c 정책).
+        """
+        if not self._wysiwyg_active:
+            return
+        if op not in ("row_add", "row_del", "col_add", "col_del"):
+            return
+        js = _WYSIWYG_TABLE_OP_JS % op
+        try:
+            self.view.page().runJavaScript(js)
+        except Exception:
+            pass
+        self._capture_wysiwyg_once(final=False)      # _doc_text 동기화(폴링 보조).
 
     # ------------------------------------------------------------------ #
     # (b) 에디터(QTextCursor) 경로 — 마크다운 마커 삽입/토글
@@ -891,6 +1329,124 @@ class MainWindow(QMainWindow):
         )
 
     # ------------------------------------------------------------------ #
+    # (표) 소스 편집기 경로 — GFM 골격 삽입 + 표블록 파싱·조작·재구성(§a.2/§b)
+    # ------------------------------------------------------------------ #
+    def _editor_insert_table(self, rows: int, cols: int) -> None:
+        """커서 위치에 GFM 표 골격 삽입(undo 1스텝). 삽입 후 헤더 첫 셀에 커서(§a.2).
+
+        커서가 줄 중간/비빈 줄이면 표 앞에 개행 보정(표는 블록 — GFM 파싱 보호).
+        insertText → textChanged → dirty+디바운스 렌더 자동(별도 호출 불필요).
+        """
+        cols = max(1, int(cols))
+        rows = max(1, int(rows))
+        table = build_gfm_table_skeleton(rows, cols)  # 순수 함수(헤더 첫 칸='열1').
+
+        cur = self.editor.textCursor()
+        block_text = cur.block().text()
+        at_block_start = cur.positionInBlock() == 0
+        prefix = "" if (at_block_start and not block_text.strip()) else "\n"
+        start = cur.position()
+        cur.beginEditBlock()
+        try:
+            cur.insertText(prefix + table + "\n")
+        finally:
+            cur.endEditBlock()
+        # 커서를 헤더 첫 셀('열1')에 배치(바로 덮어쓰기 가능하게 선택까지).
+        # 위치 = start + len(prefix) + 2("| ").
+        try:
+            cell0 = start + len(prefix) + 2
+            cur.setPosition(cell0)
+            cur.setPosition(cell0 + len("열1"), QTextCursor.MoveMode.KeepAnchor)
+            self.editor.setTextCursor(cur)
+        except Exception:
+            pass
+        self.editor.setFocus()
+        self.statusBar().showMessage("표를 삽입했습니다.", 2000)
+
+    def _find_table_block(self) -> "TableBlock | None":
+        """커서가 속한 표블록을 찾아 파싱(GUI 헬퍼). 표 밖/유효하지 않으면 None(§b.1)."""
+        doc = self.editor.document()
+        cur = self.editor.textCursor()
+        n = cur.blockNumber()
+        if "|" not in doc.findBlockByNumber(n).text():
+            return None  # 커서 줄이 표 라인 아님.
+        # 위로 확장.
+        top = n
+        while top - 1 >= 0:
+            t = doc.findBlockByNumber(top - 1).text()
+            if "|" in t and t.strip():
+                top -= 1
+            else:
+                break
+        # 아래로 확장.
+        last = doc.blockCount() - 1
+        bottom = n
+        while bottom + 1 <= last:
+            t = doc.findBlockByNumber(bottom + 1).text()
+            if "|" in t and t.strip():
+                bottom += 1
+            else:
+                break
+        lines = [doc.findBlockByNumber(i).text() for i in range(top, bottom + 1)]
+        return parse_table_lines(top, bottom, lines)  # 순수 함수(구분행 없으면 None).
+
+    def _editor_table_op(self, op: str) -> None:
+        """소스 편집기 표 행/열 조작: 파싱→조작→재구성→블록 치환(undo 1스텝, §b.3).
+
+        표 밖/유효하지 않으면 상태바 안내(크래시 금지). 거부(빈표/헤더행 삭제 등)도 안내.
+        """
+        tb = self._find_table_block()
+        if tb is None:
+            self.statusBar().showMessage(
+                "표 안에 커서를 두고 사용하세요(구분행 --- 이 있는 GFM 표).", 3000
+            )
+            return
+        cur = self.editor.textCursor()
+        line_idx = cur.blockNumber() - tb.top
+        line_text = self.editor.document().findBlockByNumber(
+            cur.blockNumber()
+        ).text()
+        col_idx = cursor_col_index(line_text, cur.positionInBlock(), tb.ncols)
+        changed = apply_table_op(tb, op, line_idx, col_idx)  # 순수 로직(거부=False).
+        if not changed:
+            msgs = {
+                "row_del": "본문 행에 커서를 두세요(마지막 1행/헤더는 삭제 불가).",
+                "col_del": "열이 1개뿐이라 삭제할 수 없습니다.",
+            }
+            self.statusBar().showMessage(
+                msgs.get(op, "표 조작을 적용할 수 없습니다."), 3000
+            )
+            return
+        self._replace_table_block(tb, render_table_block(tb))  # 블록 치환(undo 1스텝).
+        self.editor.setFocus()
+
+    def _replace_table_block(self, tb: "TableBlock", new_text: str) -> None:
+        """[tb.top, tb.bottom] 블록 범위를 new_text 로 치환(undo 1스텝, §b.3).
+
+        insertText 가 textChanged → dirty+디바운스 렌더 자동(별도 호출 불필요).
+        치환 후 커서는 표 시작 부근(best-effort — 정밀 셀 추적은 범위 외).
+        """
+        doc = self.editor.document()
+        start_blk = doc.findBlockByNumber(tb.top)
+        end_blk = doc.findBlockByNumber(tb.bottom)
+        start_pos = start_blk.position()
+        end_pos = end_blk.position() + end_blk.length() - 1  # 블록 끝(개행 제외).
+        cur = self.editor.textCursor()
+        cur.beginEditBlock()
+        try:
+            cur.setPosition(start_pos)
+            cur.setPosition(end_pos, QTextCursor.MoveMode.KeepAnchor)
+            cur.insertText(new_text)  # 선택 치환.
+        finally:
+            cur.endEditBlock()
+        # 커서를 표 시작 부근(헤더 첫 셀 근처)으로(best-effort).
+        try:
+            cur.setPosition(min(start_pos + 2, doc.characterCount() - 1))
+            self.editor.setTextCursor(cur)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
     # Undo / Redo — 활성 surface 라우팅(Editor/Split=editor, WYSIWYG=execCommand)
     # ------------------------------------------------------------------ #
     def do_undo(self) -> None:
@@ -1010,6 +1566,24 @@ class MainWindow(QMainWindow):
     def _set_dirty(self, dirty: bool) -> None:
         self._dirty = dirty
         self._update_title()
+        # 문서가 바뀌는 모든 지점(_set_scratch/_new_scratch/_attach_path/_load_from_disk/
+        # _write_to/editor textChanged/_ingest_wysiwyg_html)에서 _set_dirty 가 호출되므로
+        # 여기서 내보내기 액션 활성 상태를 함께 갱신한다(빈 문서 게이팅, 설계 §4.4).
+        self._update_export_actions_enabled()
+
+    def _update_export_actions_enabled(self) -> None:
+        """빈 문서면 PDF/Word 내보내기 액션을 비활성(설계 §4.4).
+
+        _EXPORT_AVAILABLE 가 False 면 Word 는 항상 비활성(코어 미연결). 편집 중
+        디바운스로 _doc_text 가 한 박자 늦어 "비었는데 활성"이어도 export 진입 시
+        flush(§5)로 최신화되고 빈 문서 방어가 다시 막으므로 무해하다.
+        """
+        has_doc = bool(self._doc_text.strip())
+        # _build_actions 이전(초기화 극초반)에 호출될 가능성 방어.
+        if hasattr(self, "act_export_pdf"):
+            self.act_export_pdf.setEnabled(has_doc)
+        if hasattr(self, "act_export_docx"):
+            self.act_export_docx.setEnabled(has_doc and _EXPORT_AVAILABLE)
 
     def _update_title(self) -> None:
         name = self._path.name if self._path is not None else "제목 없음"
@@ -1480,29 +2054,38 @@ class MainWindow(QMainWindow):
             return self.save_as()
         return self._write_to(self._path)
 
-    def _save_after_wysiwyg_capture(self) -> None:
-        """WYSIWYG 최신 편집을 캡처해 _doc_text 확정 후 저장(비동기, §4.4)."""
+    def _capture_wysiwyg_then(self, then) -> None:
+        """WYSIWYG 편집 컨테이너 innerHTML 1회 캡처 → _ingest → then() 실행(비동기).
+
+        저장/내보내기 공용 캡처 헬퍼(설계 §5.2). WYSIWYG 활성 중에는 마지막 타이핑이
+        다음 폴링 tick 전이라 _doc_text 에 없을 수 있으므로, 동작 직전에 한 번 더 캡처해
+        최신 _doc_text 를 확정한 뒤 then() 을 호출한다. 캡처 실패 시에도 then() 은
+        호출한다(폴링이 잡아둔 최신 _doc_text 로 best-effort 진행).
+        """
         js_get = (
             "(function(){var a=document.getElementById(%r);"
             "return a ? a.innerHTML : null;})()" % _WYSIWYG_ROOT_ID
         )
 
+        def _cb(html) -> None:
+            if isinstance(html, str):
+                self._ingest_wysiwyg_html(html)  # _doc_text 최신화(변화 시 dirty).
+            then()
+
+        try:
+            self.view.page().runJavaScript(js_get, 0, _cb)
+        except Exception:
+            then()
+
+    def _save_after_wysiwyg_capture(self) -> None:
+        """WYSIWYG 최신 편집을 캡처해 _doc_text 확정 후 저장(비동기, §4.4)."""
         def _do_write() -> None:
             if self._path is None:
                 self.save_as()
             else:
                 self._write_to(self._path)
 
-        def _cb(html) -> None:
-            if isinstance(html, str):
-                self._ingest_wysiwyg_html(html)  # _doc_text 최신화(변화 시 dirty).
-            _do_write()
-
-        try:
-            self.view.page().runJavaScript(js_get, 0, _cb)
-        except Exception:
-            # 캡처 실패 시에도 현재 _doc_text 로 저장(폴링이 잡아둔 최신).
-            _do_write()
+        self._capture_wysiwyg_then(_do_write)
 
     def save_as(self) -> bool:
         """Ctrl+Shift+S: 항상 파일 대화상자. *.md 기본, 확장자 없으면 .md 보정."""
@@ -1540,6 +2123,188 @@ class MainWindow(QMainWindow):
         suffix = "  (임시 문서를 파일로 저장)" if was_scratch else ""
         self.statusBar().showMessage(f"저장됨: {path}{suffix}", 3000)
         return True
+
+    # ------------------------------------------------------------------ #
+    # 내보내기(Phase 10) — PDF(오프스크린 printToPdf) / Word(.docx, core 호출)
+    #   입력원은 항상 _doc_text(화면 테마/줌/스크롤 무관). 내보내기 전 §5 로 최신화.
+    # ------------------------------------------------------------------ #
+    def _prepare_doc_for_export(self) -> None:
+        """편집 중 _doc_text 최신화(동기 경로). Editor/Split 의 디바운스 flush(§5.1)."""
+        self._flush_pending_edit()
+
+    def _export_after_wysiwyg_capture(self, then) -> None:
+        """WYSIWYG innerHTML 1회 캡처 → _ingest → then() (저장 캡처와 동형, §5.2).
+
+        then 은 실제 내보내기 동작(_do_export_pdf / _do_export_docx). 캡처 후 호출되어
+        마지막 타이핑이 결과물에 포함된다.
+        """
+        self._capture_wysiwyg_then(then)
+
+    def _current_title(self) -> str | None:
+        """현재 문서 제목(첫 h1) — 직전 렌더 캐시(_doc_title) 우선, 없으면 즉석 계산.
+
+        내보내기 기본 파일명/ docx core_properties.title 에 사용. 빈 문자열은 None 취급.
+        """
+        title = self._doc_title
+        if not title and self._doc_text.strip():
+            # 캐시가 비어 있으면(이론상 드묾) 즉석 render 로 제목만 계산.
+            try:
+                base_dir = self._path.parent if self._path else self._scratch_base_dir()
+                title = getattr(render(self._doc_text, base_dir=base_dir), "title", None)
+            except Exception:
+                title = None
+        return title or None
+
+    def _suggest_export_name(self, ext: str) -> Path:
+        """내보내기 기본 파일 경로: title(첫 h1) → _path stem → '제목 없음'.<ext>(설계 §4.5)."""
+        base_dir = self._path.parent if self._path else self._scratch_base_dir()
+        if self._path is not None:
+            stem = self._path.stem
+        else:
+            stem = self._current_title() or "제목 없음"
+        return base_dir / f"{stem}.{ext}"
+
+    # ---- Word(.docx) 내보내기 — 동기(core 호출, §4.6) ----------------------
+    def export_docx(self) -> None:
+        """Word(.docx) 내보내기 진입. WYSIWYG 면 캡처 후, 아니면 flush 후 실제 내보내기."""
+        if self._wysiwyg_active:
+            self._export_after_wysiwyg_capture(self._do_export_docx)
+            return
+        self._prepare_doc_for_export()
+        self._do_export_docx()
+
+    def _do_export_docx(self) -> None:
+        """_doc_text → markdown_to_docx(core). 빈 문서 방어 + 경로 선택 + OSError 안내."""
+        if not self._doc_text.strip():
+            self.statusBar().showMessage("내보낼 내용이 없습니다.", 3000)
+            return
+        start = str(self._suggest_export_name("docx"))
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "Word(.docx)로 내보내기", start,
+            "Word 문서 (*.docx);;모든 파일 (*.*)",
+        )
+        if not path_str:
+            return  # 사용자 취소
+        path = Path(path_str)
+        if path.suffix == "":
+            path = path.with_suffix(".docx")
+        base_dir = self._path.parent if self._path else self._scratch_base_dir()
+        title = self._current_title()
+        try:
+            # core 경계(설계 §2.1): 반환 None, OSError 만 전파, 변환 오류는 비전파.
+            markdown_to_docx(self._doc_text, path, base_dir, title=title)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "내보내기 실패", f"Word 문서를 저장할 수 없습니다:\n{exc}"
+            )
+            return
+        self.statusBar().showMessage(f"Word 문서로 내보냈습니다: {path}", 4000)
+
+    # ---- PDF 내보내기 — 오프스크린 비동기(printToPdf, §3) ------------------
+    def export_pdf(self) -> None:
+        """PDF 내보내기 진입. WYSIWYG 면 캡처 후, 아니면 flush 후 실제 내보내기(§5)."""
+        if self._wysiwyg_active:
+            self._export_after_wysiwyg_capture(self._do_export_pdf)
+            return
+        self._prepare_doc_for_export()
+        self._do_export_pdf()
+
+    def _do_export_pdf(self) -> None:
+        """빈 문서 방어 → 경로 선택(.pdf 보정) → 재진입 가드 → 비동기 내보내기 시작."""
+        if not self._doc_text.strip():
+            self.statusBar().showMessage("내보낼 내용이 없습니다.", 3000)
+            return
+        if self._pdf_busy:
+            self.statusBar().showMessage("이미 PDF를 내보내는 중입니다...", 3000)
+            return
+        start = str(self._suggest_export_name("pdf"))
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "PDF로 내보내기", start, "PDF 문서 (*.pdf);;모든 파일 (*.*)"
+        )
+        if not path_str:
+            return  # 사용자 취소
+        out_path = Path(path_str)
+        if out_path.suffix == "":
+            out_path = out_path.with_suffix(".pdf")
+        self._export_pdf_async(out_path)
+
+    def _export_pdf_async(self, out_path: Path) -> None:
+        """오프스크린 QWebEnginePage 에 라이트 강제 렌더본을 띄워 비동기 인쇄 준비(§3.2).
+
+        ★ page 는 반드시 self._pdf_page 로 보관(로컬 변수만 두면 GC 로 인쇄 조용히 실패).
+        모든 단계 try/except — 실패 시 _finish_pdf() 로 가드/참조를 반드시 정리(영구 busy 방지).
+        """
+        self._pdf_busy = True
+        self.statusBar().showMessage("PDF 내보내는 중...")
+        try:
+            base_dir = self._path.parent if self._path else self._scratch_base_dir()
+            body = getattr(render(self._doc_text, base_dir=base_dir), "html", "") or ""
+            # ★ 인쇄는 화면 테마와 독립 — 항상 라이트로 강제(설계 §3.1/§3.4).
+            html = theme_mod.wrap_document(body, False)
+
+            page = QWebEnginePage(self)     # self 부모(윈도우 수명에 묶음)
+            self._pdf_page = page           # ★ GC 방지(멤버 보관 필수)
+            # 화면 뷰와 동일한 보안 속성(file:// 출처에서 로컬/원격 리소스 허용, §3.5).
+            s = page.settings()
+            s.setAttribute(
+                QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True
+            )
+            s.setAttribute(
+                QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True
+            )
+            page.loadFinished.connect(
+                lambda ok: self._on_pdf_load_finished(ok, out_path)
+            )
+            base = QUrl.fromLocalFile(str(base_dir) + "/")  # 상대 이미지/링크 기준
+            page.setHtml(html, base)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "내보내기 실패", f"PDF를 준비할 수 없습니다:\n{exc}"
+            )
+            self._finish_pdf()
+
+    def _on_pdf_load_finished(self, ok: bool, out_path: Path) -> None:
+        """오프스크린 페이지 로드 완료 → A4 세로 레이아웃으로 printToPdf 시작(§3.2)."""
+        if not ok:
+            QMessageBox.warning(
+                self, "내보내기 실패", "PDF 렌더링에 실패했습니다(페이지 로드 실패)."
+            )
+            self._finish_pdf()
+            return
+        try:
+            layout = QPageLayout(
+                QPageSize(QPageSize.PageSizeId.A4),
+                QPageLayout.Orientation.Portrait,
+                QMarginsF(12.7, 12.7, 12.7, 12.7),  # 0.5in 균일
+                QPageLayout.Unit.Millimeter,
+            )
+            self._pdf_page.pdfPrintingFinished.connect(self._on_pdf_printing_finished)
+            self._pdf_page.printToPdf(str(out_path), layout)  # 비동기
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "내보내기 실패", f"PDF 인쇄를 시작할 수 없습니다:\n{exc}"
+            )
+            self._finish_pdf()
+
+    def _on_pdf_printing_finished(self, file_path: str, ok: bool) -> None:
+        """printToPdf 완료 통지 → 사용자 안내 후 가드/참조 정리(§3.2)."""
+        try:
+            if ok:
+                self.statusBar().showMessage(f"PDF 저장됨: {file_path}", 4000)
+            else:
+                QMessageBox.warning(
+                    self, "내보내기 실패", "PDF 파일을 저장하지 못했습니다."
+                )
+        finally:
+            self._finish_pdf()
+
+    def _finish_pdf(self) -> None:
+        """PDF 내보내기 종료 — 오프스크린 페이지 참조 해제 + 재진입 가드 해제.
+
+        실패/성공 모든 경로의 종착점. 한 번의 실패가 영구 busy 로 굳지 않도록 보장한다.
+        """
+        self._pdf_page = None
+        self._pdf_busy = False
 
     def _maybe_discard(self) -> bool:
         """미저장 변경이 있으면 저장/버림/취소 묻기. True=계속 진행 가능."""
@@ -1657,6 +2422,8 @@ class MainWindow(QMainWindow):
 
     def _set_document(self, result, restore_scroll: bool) -> None:
         body = getattr(result, "html", "") or ""
+        # 직전 렌더의 제목(첫 h1)을 캐싱 — 내보내기 기본 파일명/docx title 용.
+        self._doc_title = getattr(result, "title", None)
         dark = self._theme == theme_mod.DARK
         html = theme_mod.wrap_document(body, dark)
         # scratch 도 base_dir 을 부여해 상대 링크/이미지 해석 기준을 제공.
@@ -1887,7 +2654,11 @@ class MainWindow(QMainWindow):
             "서식 툴바: 편집기/분할/라이브 편집에서 표시됩니다. 편집기/분할에선 "
             "마크다운 마커(**, *, ~~, `, 목록/인용/제목)를 삽입하고, "
             "라이브 편집(WYSIWYG)에선 미리보기에서 직접 서식을 적용합니다. "
-            "마크다운 소스가 정규화될 수 있습니다(내용은 보존).</p>",
+            "마크다운 소스가 정규화될 수 있습니다(내용은 보존).</p>"
+            "<p style='color:gray;font-size:0.82em'>"
+            "표: 편집기/분할에선 GFM 파이프표로 정확히 편집되고, "
+            "라이브 편집(WYSIWYG)에선 정렬/병합셀이 단순화될 수 있습니다 — "
+            "정밀 표 작업은 편집기/분할을 권장합니다.</p>",
         )
 
     # ------------------------------------------------------------------ #

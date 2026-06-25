@@ -222,3 +222,100 @@ def write_markdown(path: Path, text: str) -> None
 - [x] `write_markdown(path, None)` → 빈 파일
 - [x] `write_markdown(디렉터리경로, "x")` → `OSError` 전파
 - [x] 두 import 경로(`from mdviewer ...`, `from mdviewer.renderer ...`) 모두 동작, `render` 회귀 없음
+
+---
+
+## 10. Word(.docx) 내보내기 — `exporter.py` (Phase 10)
+
+> 추가: core-engine-dev · 2026-06-25
+> 구현 파일: **신규** `src/mdviewer/exporter.py`, 수정 `__init__.py`/`requirements.txt`/`pyproject.toml`
+> 입력 계약: `_workspace/10_export_feature_design.md` §2 (시그니처/예외/매핑 전부 준수)
+
+### 10.1 공개 시그니처 (설계 §2.1 과 **글자 그대로** 동일 — 임의 변경 없음)
+
+```python
+# 패키지 루트 (권장) — ui-dev 가 import 하는 유일한 신규 심볼
+from mdviewer import markdown_to_docx
+# 또는 모듈 직접
+from mdviewer.exporter import markdown_to_docx
+
+def markdown_to_docx(
+    markdown_text: str,
+    out_path: Path,
+    base_dir: Path,
+    *,
+    title: str | None = None,
+) -> None
+```
+
+- `inspect.signature` 확인값: `(markdown_text: 'str', out_path: 'Path', base_dir: 'Path', *, title: 'str | None' = None) -> 'None'`
+  (`from __future__ import annotations` 로 주석이 문자열 형태 — shape 동일).
+- `title` 은 **keyword-only**, default `None`. 반환 **`None`**.
+- PDF 내보내기는 **UI 전용** → core 미노출(`__init__` 에 없음). core 신규 심볼은 이것 하나뿐.
+
+### 10.2 예외 정책 (ui-dev 가 try/except 로 감싸야 하는 범위)
+
+| 상황 | 동작 |
+|------|------|
+| 빈/`None`/공백/깨진 입력, 알 수 없는 태그, 깨진 이미지 | **예외 비전파** — 최선의(부분) docx 저장 |
+| `render()` 내부 오류 | 비전파(render 가 애초에 안 던짐; 이중 방어) |
+| 이미지 임베드 실패(포맷 미지원/없음/원격) | 비전파 — `alt`(없으면 `[이미지]`) 이탤릭 run 폴백, **네트워크 다운로드 안 함** |
+| 부모 디렉터리 생성 / `Document.save(out_path)` 실패 | **`OSError` 전파** (write_markdown 과 대칭) |
+
+→ **ui-dev 는 호출을 `try/except OSError` 로만 감싸면 충분**(설계 §4.6 그대로).
+그 외 어떤 예외도 올라오지 않는다. `out_path.parent.mkdir(parents=True, exist_ok=True)` 선행.
+
+### 10.3 매핑 동작 요약 (QA 대조용 — 실제 검증된 결과)
+
+- h1~h6 → `Heading 1`~`6`. p → 일반 단락 + 인라인 run.
+- 인라인: strong/b→`bold`, em/i→`italic`, s/del/strike→`font.strike`, code→Consolas 10pt(+옅은 음영),
+  중첩 서식은 활성 카운트 스택으로 누적 적용(`<strong><em>x</em></strong>` 정확).
+- a → 정식 `w:hyperlink`(파란 밑줄) 시도, 실패 시 `텍스트 (URL)` 폴백. br → `run.add_break()`.
+- ul/ol → `List Bullet`/`List Number`(+중첩 깊이 `2`/`3`). blockquote 내부 p → `Intense Quote`(없으면 `Quote`).
+- 코드펜스(이중 `<pre>`+codehilite span) → **텍스트만** 추출(개행 보존), 라인별 Consolas 단락. Pygments 색은 버림.
+- table → `add_table` + `Light Grid Accent 1`(없으면 `Table Grid`). thead/tbody의 th/td를 셀로.
+- task-list → `☑ `/`☐ ` 접두(List Bullet). `<input checked>` 유무로 판정. 선행 공백 1개 정리.
+- img(`file:///…`) → URI→로컬경로 복원 후 존재 시 `add_picture`(본문폭 6.3in 초과 시 클램프), 아니면 alt 폴백.
+- hr → `─`×30 단락. 알 수 없는 태그 → 자식 텍스트만 보존.
+- `title` 지정 시 `core_properties.title` 기록(본문 제목 단락 추가 안 함).
+
+### 10.4 의존성·격리·패키징
+
+- `requirements.txt`/`pyproject.toml` 에 `python-docx>=1.1` 추가(설치 확인: **1.2.0**).
+- python-docx(+lxml)는 **함수 내부 지연 import** → `import mdviewer` / `import mdviewer.exporter`
+  시점에 docx/lxml **미로드**(렌더 핫패스 격리). `markdown_to_docx` **호출 시점**에만 로드.
+  (직접 검증: 모듈 import 후 `sys.modules` 에 docx/lxml 없음 → 호출 후 존재.)
+- **PySide6 무의존**(import 문 grep 0건; 문자열은 docstring 의 "PySide6 에 의존하지 않는다"뿐).
+- **bs4/lxml 직접 파싱 안 함** — walk 는 stdlib `html.parser.HTMLParser`. (python-docx가 내부적으로 lxml 사용하는 것은 무방.)
+- packager 영향: 설계 §7 대로 `mdviewer.spec` 에 `collect_all("docx")` + `collect_all("lxml")` 필요(core 가 직접 손대지 않음).
+
+### 10.5 검증 완료 (GUI 불필요, 직접 import 스모크)
+
+- [x] `inspect.signature` 가 설계 §2.1 과 정확히 일치(keyword-only `title`, 반환 None)
+- [x] 대표 마크다운(헤딩/굵게·기울임·인라인코드·취소선/링크/중첩목록/인용/표/코드펜스2종/hr/task/로컬이미지) → 파일 생성·크기>0, `docx.Document` 재오픈 검증
+- [x] Heading 1 스타일, bold/italic/strike run, Consolas 코드(개행 보존), 표 셀 일치, `☑`/`☐` 접두, 중첩 List 스타일, Intense Quote
+- [x] 로컬 PNG 임베드(`inline_shapes==1`) / 없는 file:// → alt 폴백 / 원격 http → **다운로드 없이** alt 폴백
+- [x] 빈 문자열/`None`/공백/깨진 입력 → 예외 없이 유효 docx 저장
+- [x] 쓰기 불가 경로(존재하는 디렉터리명) → **`OSError`(PermissionError) 전파**
+- [x] `title="X"` → `core_properties.title == "X"`
+- [x] 패키지 루트·모듈 두 import 경로 동작, `__all__` 에 `markdown_to_docx` 포함
+- [x] 지연 import 격리(모듈 import 시 docx/lxml 미로드) · PySide6 무의존 · stdlib html.parser 사용
+
+### 10.6 BUG-01 수정 (중첩 목록 구조 평탄화) — 2026-06-25
+
+- **증상:** 자식 목록을 가진 부모 `<li>` 텍스트가 첫 자식 항목에 병합되고 자식 깊이
+  스타일(List Bullet 2 등)로 잘못 렌더(예: `'Item B\n\nNested B1'` 한 단락).
+- **원인:** `_DocxBuilder._start` 의 `ul`/`ol` 진입 시 부모 `<li>` 의 누적 인라인
+  (`self._inlines`)을 flush 하지 않아 같은 버퍼에 자식 항목과 섞임.
+- **수정 위치/내용:**
+  1. `_start` 의 `tag in ("ul","ol")` 분기 — 리스트 컨텍스트(`_ctx[-1]=="li"`)면 자식
+     목록 열기 **직전에** `_flush_list_item()` 호출. 이 시점 `_list_stack`/`_li_task[-1]`
+     이 아직 **부모** 레벨이라 올바른 깊이/종류/태스크 상태로 emit. flush 후 `_inlines`
+     가 비어 이후 부모 `</li>` 재flush 는 no-op(중복 emit 없음).
+  2. 신규 헬퍼 `_trim_boundary_ws(inlines)` + `_flush_list_item` 도입부에서 호출 —
+     HTML 직렬화가 경계에 끼우는 구조적 공백(`'Item B\n'`/`'\nNested'`)을 첫/마지막
+     텍스트 조각의 바깥쪽만 트림(내부 간격·인라인 서식·break 보존).
+- **검증(자체):** QA 예시가 `Item B`(List Bullet) + `Nested B1`(List Bullet 2) 별도
+  항목으로 정확. 깊은/순서/혼합 중첩, 서식 있는 부모(bold run 보존), 평탄 목록·태스크
+  목록 회귀 없음, 텍스트 무손실, 기존 전체 배터리 전부 통과(회귀 0).
+- QA 가 `test_nested_list_structure`(strict xfail) 추적 중 — 코드 수정 완료, **xfail 마커 제거 후 정상 통과로 전환은 QA 담당**(core 는 코드만 수정).

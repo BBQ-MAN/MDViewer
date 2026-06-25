@@ -23,3 +23,7 @@ charset-normalizer>=3.3   # 임의 인코딩 파일 안전 디코딩
 
 # --- HTML → Markdown 변환 (코어 엔진; 클립보드 붙여넣기) ---
 html2text>=2024.2.26      # 순수 파이썬, 런타임 무의존 → PyInstaller 번들 안전
+
+# --- Word(.docx) 내보내기 (코어 엔진) ---
+python-docx>=1.1          # OOXML 문서 생성. lxml 의존(C 확장) — exporter.py 전용
+                          #   (지연 import 로 렌더 핫패스에서 격리; 패키징은 collect_all("docx"/"lxml"))

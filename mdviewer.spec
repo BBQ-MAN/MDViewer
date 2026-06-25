@@ -31,6 +31,30 @@ IS_WIN = sys.platform == "win32"
 # Qt/WebEngine 전체 수집 (--collect-all PySide6 상당)
 datas, binaries, hiddenimports = collect_all("PySide6")
 
+# --- Word(.docx) 내보내기 의존성 수집 (Phase 10, 설계 §7.1) ----------------
+# exporter.py 가 markdown_to_docx 내부에서 `from docx import Document` 등을
+# **지연 import** 하므로 PyInstaller 정적 분석이 놓칠 수 있다. 명시 수집 필수.
+#
+# ⚠️ collect_all 의 인자는 *import 이름*이다. python-docx 의 import 이름은 'docx'
+#    (배포명 python-docx 와 다름). collect_all("docx") 가 맞다.
+#
+# collect_all("docx") 는 빈 문서 템플릿(templates/default.docx,
+# templates/default-docx-template/*, default-*.xml 스타일)을 datas 로,
+# 모듈들을 hiddenimports 로 수집한다. 누락 시 frozen 에서 PackageNotFoundError /
+# "템플릿 못 찾음" 으로 .docx 생성이 실패한다.
+_docx_datas, _docx_bins, _docx_hidden = collect_all("docx")
+datas += _docx_datas
+binaries += _docx_bins
+hiddenimports += _docx_hidden
+
+# lxml 네이티브(C 확장 .pyd = libxml2 바인딩). python-docx 의 트랜지티브 의존.
+# PyInstaller 기본 훅이 대개 처리하나, 명시 수집으로 etree*.pyd 번들을 보장한다.
+_lxml_datas, _lxml_bins, _lxml_hidden = collect_all("lxml")
+datas += _lxml_datas
+binaries += _lxml_bins
+hiddenimports += _lxml_hidden
+# --------------------------------------------------------------------------
+
 # 앱 리소스(styles/ 등). 대상 경로는 paths._BUNDLE_RESOURCE_SUBPATH 와 반드시 일치.
 datas += [("src/mdviewer/resources", "mdviewer/resources")]
 
