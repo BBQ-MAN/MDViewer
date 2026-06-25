@@ -1,6 +1,34 @@
 # UI 구현 노트 (ui-dev)
 
-> 작성: ui-dev · 2026-06-01 · 갱신: 2026-06-25(Phase 8 WYSIWYG 라이브 편집) · 대상: QA / packager / core-engine-dev
+> 작성: ui-dev · 2026-06-01 · 갱신: 2026-06-25(Phase 9 워드프로세서 UI: 새 문서 + 단축 버튼 툴바 + 통합 서식) · 대상: QA / packager / core-engine-dev
+
+## 0-C. Phase 9 변경 요약 (새 문서 + 워드프로세서식 툴바 + Undo/Redo + 통합 서식 디스패치)
+
+설계서: `_workspace/09_wordprocessor_ui_design.md`(계약). **소유권 준수**: `main_window.py` **단일 파일** 수정. `settings.py`/`theme.py`/`renderer.py`/`file_watcher.py`/`requirements.txt`/`mdviewer.spec` **무변경**(core/settings/theme 변경 0, 신규 리소스/JS 자산 0 → 패키징 안전). 모듈 상단 import 추가: `re`, `QComboBox`/`QStyle`(QtWidgets), `QTextCursor`(QtGui). 모듈 상수 추가: `_INLINE_MARK`/`_LINE_PREFIX`/`_HEADING_PREFIX`/`_HEADING_RE`.
+
+**(1) 새 문서 `act_new`(Ctrl+N, `QKeySequence.StandardKey.New`)** — 파일 메뉴 맨 위 + 툴바 첫 버튼, 아이콘 `SP_FileIcon`. 슬롯 `new_document()`: `_maybe_discard()` 가드(취소면 중단) → `_leave_wysiwyg_for_document_change()`(WYSIWYG 탈출) → `_clear_external_change_banner()` → `_new_scratch()` → 현재 모드가 `MODE_PREVIEW` 면 `_apply_view_mode(MODE_SPLIT)`(편집 가능 보장) → `editor.setFocus()` + 상태바 안내. **`_new_scratch()`**(별도 헬퍼, `_set_scratch`(paste, dirty=True)와 분리): watcher.stop() → `_path=None`·`_doc_text=""`·`_pending_scroll=None` → `_render_doc(preserve_scroll=False)` 빈 렌더 → `_sync_editor_from_doc()` 편집기 비움 → **`_set_dirty(False)`(★ 빈 새 문서는 깨끗, 타이틀 "제목 없음")**.
+
+**(2) 메인 툴바 워드프로세서식 재구성(`_build_toolbar`)**: `setToolButtonStyle(ToolButtonTextBesideIcon)`(아이콘+한글 라벨 병기). 그룹+`addSeparator()`+전 액션 `setToolTip("이름 (단축키)")`. 순서 = **[파일] 새 문서·열기·저장 | [편집] 실행취소·다시실행 | [보기] 편집기·미리보기·분할·라이브편집(QActionGroup 라디오) · 줌-·줌리셋·줌+ · 테마·목차**. 다른이름저장/새로고침/붙여넣기는 **툴바 제외(메뉴 유지)**. 아이콘 = `QStyle.standardIcon`만(신규 자산 0): new=`SP_FileIcon`, open=`SP_DialogOpenButton`, save=`SP_DialogSaveButton`, undo=`SP_ArrowBack`, redo=`SP_ArrowForward`. 표준아이콘 부재 액션(줌/테마/목차/모드)은 텍스트 라벨만(아이콘 강제 금지). 메뉴: 파일(새 문서 맨 위)·**편집(&E) 신규(실행취소/다시실행)**·보기(변경 없음).
+
+**(3) Undo/Redo — 활성 surface 라우팅**: `act_undo`(`StandardKey.Undo`=Ctrl+Z)→`do_undo`, `act_redo`(`setShortcuts([StandardKey.Redo, Ctrl+Shift+Z, Ctrl+Y])`)→`do_redo`. 라우팅: `_is_wysiwyg_surface()` 면 `_wysiwyg_exec_simple("undo"/"redo")`(execCommand + `_capture_wysiwyg_once(final=False)` 로 `_doc_text` 동기화); `_is_source_editor_surface()` 면 `editor.undo()/redo()`; Preview 전용은 no-op. `_apply_view_mode` 에서 `edit_surface = mode in (EDITOR,SPLIT,WYSIWYG)` 일 때만 `act_undo/act_redo.setEnabled(True)`(Preview 비활성). **Ctrl+Z 편집기 내장 경합**: 라우팅 슬롯이 결국 `editor.undo()` 를 호출하므로 결과 동일(WindowShortcut 유지 — 버그 아님).
+
+**(4) ★ 통합 서식 디스패치(surface-aware)**: 서식 툴바를 WYSIWYG 전용에서 **편집 surface 공통(Editor/Split/WYSIWYG)** 으로 확장. surface 판별 헬퍼: `_is_source_editor_surface()`=`_view_mode in (EDITOR,SPLIT)`, `_is_wysiwyg_surface()`=`_view_mode==WYSIWYG and _wysiwyg_active`, `_is_edit_surface()`. 의미 단위 슬롯(`fmt_bold/italic/strike/code/ul/ol/quote/link/clear/heading`) → `_dispatch_*` 가 활성 surface 분기:
+  - **(a) 에디터(Editor/Split) = QTextCursor 마크다운**(`_editor_inline`/`_editor_block`/`_editor_heading`/`_editor_link`/`_editor_clear`): 굵게=선택 `**` 감쌈(토글: 양끝 이미 마커면 제거), 기울임=`*`, 취소선=`~~`, 인라인코드=백틱; 선택 없으면 마커 쌍 삽입+커서 가운데. 블록=줄머리 접두 토글(`_editor_apply_line_prefix`, `beginEditBlock/endEditBlock` 로 undo 1스텝): 불릿 `"- "`, 번호 `"1. "`, 인용 `"> "`; H1/H2/H3 `#/##/### `(exclusive, 기존 `#` 접두 제거 후 부여=토글), 본문(0)=`#` 제거. 링크=`[선택](url)`/선택 없으면 `[링크 텍스트](url)`+placeholder 선택. **`insertText`/`endEditBlock` 가 `textChanged`→dirty+디바운스 렌더 자동(별도 호출 없음; `_suppress_editor_signal` 은 `setPlainText` 에만 켜짐)**. QPlainTextEdit 선택의 단락구분자 U+2029(공백 표시)를 `.replace(" ","\n")` 로 환원. 에디터 '서식 지우기'는 v1 비활성/안내.
+  - **(b) WYSIWYG = execCommand**(`_wysiwyg_inline`/`_wysiwyg_block`/`_wysiwyg_heading`/`_wysiwyg_inline_code`/`_wysiwyg_clear`): 기존 `_exec_format`/인라인코드 JS/createLink/removeFormat 경로를 **그대로 래핑**(동작 무변경). 기존 `_fmt_inline_code`/`_fmt_insert_link`/`_fmt_clear` 메서드명을 `_wysiwyg_inline_code`/디스패치/`_wysiwyg_clear` 로 정리.
+
+**(5) heading 드롭다운(`QComboBox` `cmb_heading`)**: 항목 `["본문","제목 1","제목 2","제목 3"]`, `activated`→`fmt_heading(idx)`(idx=level, 0=본문). 에디터=`#` 접두 토글, WYSIWYG=`formatBlock H1/H2/H3/P`. 서식 툴바 맨 앞에 배치. (콤보 상태 동기화=커서 줄 현재 레벨 표시는 v1 범위 외 — 적용 트리거로만.)
+
+**(6) 서식 툴바 재작성(`_build_format_toolbar`)**: `cmb_heading` | 굵게/기울임/취소선/코드 | • 목록/1. 목록/인용 | 링크/서식지우기. `_mk_fmt(label, slot, tip="")`(시그니처 확장 — tip 추가). 굵게/기울임 버튼은 `tb.widgetForAction(act).setStyleSheet("font-weight/style")` 로 B/I 강조(외부 자산 0). `tb.setVisible(False)` 초기 숨김.
+
+**(7) `_apply_view_mode` 게이팅 확장(1곳)**: `edit_surface = mode in (EDITOR,SPLIT,WYSIWYG)`; `show_format_toolbar = edit_surface`(현행 `==WYSIWYG` 에서 확장) → `format_toolbar.setVisible(편집 surface)`. 같은 자리에서 `act_undo/act_redo.setEnabled(edit_surface)`, `act_fmt_clear.setEnabled(mode==MODE_WYSIWYG)`(에디터 surface 서식지우기 모호 → 비활성). TOC/포커스/persist/액션체크/WYSIWYG 전이 기존 로직 무변경.
+
+**단축키 비충돌**: Ctrl+N/Z/Shift+Z/Y 모두 기존(O,S,R,T,V,Q,=,-,0,1~4,\\,F11)과 비충돌. 서식 명령은 단축키 없음(툴바 클릭). About 다이얼로그에 Ctrl+N/Z/Y + 서식 툴바 안내 갱신.
+
+**검증(offscreen)**: `QT_QPA_PLATFORM=offscreen` + `QTWEBENGINE_CHROMIUM_FLAGS='--disable-gpu --in-process-gpu --no-sandbox'` 스모크 **36/36 PASS** — 액션/단축키 존재(act_new Ctrl+N, act_undo Ctrl+Z, act_redo Ctrl+Shift+Z·Ctrl+Y, cmb_heading), 새 문서(빈 `_doc_text`/`_path=None`/dirty=False/타이틀 "제목 없음"/Preview→Split 편집 가능), 에디터 인라인 토글(`**hello**`↔`hello`, 빈 선택 `**` 쌍), 에디터 헤딩(`# `↔`## `↔본문 strip), 에디터 블록 다중줄 불릿 토글, **undo/redo 에디터 라우팅(typed→undo→redo)**, 게이팅(Preview 서식툴바 숨김·undo/redo 비활성 / Editor·Split 서식툴바 표시·undo 활성·fmt_clear 비활성), surface 판별 헬퍼. 기존 `pytest tests/` **78 passed, 1 skipped**(회귀 없음). `ast.parse` 구문검사 OK.
+
+**frozen 자산**: 신규 .js/datas/hiddenimports/런타임 의존성 **0**. `QStyle.StandardPixmap`(Qt 내장 아이콘 — 번들 누락 위험 0), `QComboBox`/`QTextCursor` 모두 PySide6 기존. `mdviewer.spec`/`requirements.txt` 무변경 → packager 작업 = 회귀 스모크 1회만.
+
+---
 
 ## 0-B. Phase 8 변경 요약 (WYSIWYG 라이브 편집 — 4번째 뷰 모드)
 
@@ -153,11 +181,14 @@ QApplication 의 app/org 이름을 **윈도우 생성 전에** 설정해 QSettin
 
 | 단축키 | 동작 |
 |---|---|
+| Ctrl+N | 새 문서(빈 scratch, dirty=False) — Phase 9 |
 | Ctrl+O | 열기 |
 | Ctrl+Shift+V | 클립보드를 마크다운으로 붙여넣기(→ scratch 임시 문서) |
 | Ctrl+S | 저장(scratch 면 Save As) |
 | Ctrl+Shift+S | 다른 이름으로 저장 |
-| Ctrl+1 / Ctrl+2 / Ctrl+3 | 편집기 / 미리보기 / 분할 모드(상호배타) |
+| Ctrl+Z | 실행취소(활성 surface 라우팅) — Phase 9 |
+| Ctrl+Shift+Z / Ctrl+Y | 다시실행(활성 surface 라우팅) — Phase 9 |
+| Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+4 | 편집기 / 미리보기 / 분할 / 라이브 편집 모드(상호배타) |
 | Ctrl+R | 새로고침 |
 | Ctrl+T | 테마 전환(라이트/다크) |
 | Ctrl+= / Ctrl++ | 확대 |
@@ -167,9 +198,10 @@ QApplication 의 app/org 이름을 **윈도우 생성 전에** 설정해 QSettin
 | Ctrl+\\ | 목차(TOC) 패널 토글 |
 | Ctrl+Q | 종료 |
 | 최근파일 1~9 | 메뉴 가속키 &1..&9 |
+| (서식 명령) | 단축키 없음 — 서식 툴바 클릭(편집 surface 에서만 표시) |
 
-메뉴: 파일(열기/최근 파일▸/─/붙여넣기/저장/다른이름저장/─/새로고침/─/종료) · 보기(테마/줌3종/전체화면/목차) · 도움말(정보).
-툴바: 열기·새로고침·─·붙여넣기·저장·─·줌·테마·목차. 드래그앤드롭으로 로컬 파일 열기 지원.
+메뉴(Phase 9): 파일(**새 문서**/열기/최근 파일▸/─/붙여넣기/저장/다른이름저장/─/새로고침/─/종료) · **편집(실행취소/다시실행)** · 보기(모드4종/테마/줌3종/전체화면/목차) · 도움말(정보).
+메인 툴바(Phase 9, ToolButtonTextBesideIcon): [파일]새 문서·열기·저장 ─ [편집]실행취소·다시실행 ─ [보기]모드4종 ─ 줌3종 ─ 테마·목차. 서식 툴바(별도, 편집 surface 에서만 표시): 문단스타일 콤보 ─ 굵게·기울임·취소선·코드 ─ •목록·1.목록·인용 ─ 링크·서식지우기. 드래그앤드롭으로 로컬 파일 열기 지원.
 
 ## 5. TOC 사이드 패널
 

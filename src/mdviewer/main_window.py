@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 
@@ -30,8 +31,10 @@ from PySide6.QtGui import (
     QGuiApplication,
     QIcon,
     QKeySequence,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QInputDialog,
     QListWidget,
@@ -40,6 +43,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QSplitter,
+    QStyle,
 )
 from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -129,6 +133,16 @@ _SELF_WRITE_SUPPRESS_MS = 700
 _WYSIWYG_POLL_MS = 400
 # contentEditable 컨테이너 element id(진입 JS 가 article.markdown-body 에 런타임 부여).
 _WYSIWYG_ROOT_ID = "md-editable"
+
+# ---- 통합 서식(Phase 9) — 소스 편집기 마크다운 마커/접두 ----
+# 인라인 마커(선택을 감싸 토글). 백틱은 코드.
+_INLINE_MARK = {"bold": "**", "italic": "*", "strike": "~~", "code": "`"}
+# 줄 머리 접두(목록/인용 — 토글). 번호 목록은 v1 에서 모든 줄에 "1. "(렌더러가 순번화).
+_LINE_PREFIX = {"ul": "- ", "ol": "1. ", "quote": "> "}
+# 헤딩 접두(exclusive — 기존 # 접두 제거 후 부여). 0(본문)은 모든 # 제거.
+_HEADING_PREFIX = {1: "# ", 2: "## ", 3: "### "}
+# 기존 헤딩 접두 매칭(서식 토글/제거용).
+_HEADING_RE = re.compile(r"^(#{1,6}\s+)")
 
 
 class _WatchBridge(QObject):
@@ -285,32 +299,70 @@ class MainWindow(QMainWindow):
     # 액션 / 메뉴 / 툴바
     # ------------------------------------------------------------------ #
     def _build_actions(self) -> None:
+        st = self.style()  # QStyle 표준 아이콘(신규 자산 0)
+
+        # ---- 파일 ----
+        self.act_new = QAction("새 문서", self)
+        self.act_new.setShortcut(QKeySequence.StandardKey.New)  # Ctrl+N
+        self.act_new.setToolTip("새 문서 (Ctrl+N)")
+        self.act_new.setIcon(st.standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+        self.act_new.triggered.connect(self.new_document)
+
         self.act_open = QAction("열기...", self)
         self.act_open.setShortcut(QKeySequence.StandardKey.Open)  # Ctrl+O
+        self.act_open.setToolTip("열기 (Ctrl+O)")
+        self.act_open.setIcon(st.standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton))
         self.act_open.triggered.connect(self.open_dialog)
 
         self.act_reload = QAction("새로고침", self)
         self.act_reload.setShortcut(QKeySequence("Ctrl+R"))
+        self.act_reload.setToolTip("새로고침 (Ctrl+R)")
         self.act_reload.triggered.connect(self.reload_current)
 
         self.act_paste = QAction("클립보드를 마크다운으로 붙여넣기", self)
         self.act_paste.setShortcut(QKeySequence("Ctrl+Shift+V"))
+        self.act_paste.setToolTip("클립보드를 마크다운으로 붙여넣기 (Ctrl+Shift+V)")
         self.act_paste.triggered.connect(self.paste_clipboard)
 
         self.act_save = QAction("저장", self)
         self.act_save.setShortcut(QKeySequence.StandardKey.Save)  # Ctrl+S
+        self.act_save.setToolTip("저장 (Ctrl+S)")
+        self.act_save.setIcon(st.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
         self.act_save.triggered.connect(self.save)
 
         self.act_save_as = QAction("다른 이름으로 저장...", self)
         self.act_save_as.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.act_save_as.setToolTip("다른 이름으로 저장 (Ctrl+Shift+S)")
         self.act_save_as.triggered.connect(self.save_as)
 
         self.act_exit = QAction("종료", self)
         self.act_exit.setShortcut(QKeySequence.StandardKey.Quit)
         self.act_exit.triggered.connect(self.close)
 
+        # ---- 편집(실행취소/다시실행 — 활성 surface 라우팅) ----
+        self.act_undo = QAction("실행취소", self)
+        self.act_undo.setShortcut(QKeySequence.StandardKey.Undo)  # Ctrl+Z
+        self.act_undo.setToolTip("실행취소 (Ctrl+Z)")
+        self.act_undo.setIcon(st.standardIcon(QStyle.StandardPixmap.SP_ArrowBack))
+        self.act_undo.triggered.connect(self.do_undo)
+
+        self.act_redo = QAction("다시실행", self)
+        # 표준 Redo(Windows=Ctrl+Y) + 명시적 Ctrl+Shift+Z + Ctrl+Y 모두 수용.
+        # (StandardKey.Redo 가 플랫폼별로 다르므로 두 관습을 모두 명시 — 중복은 무해.)
+        self.act_redo.setShortcuts(
+            [
+                QKeySequence.StandardKey.Redo,
+                QKeySequence("Ctrl+Shift+Z"),
+                QKeySequence("Ctrl+Y"),
+            ]
+        )
+        self.act_redo.setToolTip("다시실행 (Ctrl+Shift+Z / Ctrl+Y)")
+        self.act_redo.setIcon(st.standardIcon(QStyle.StandardPixmap.SP_ArrowForward))
+        self.act_redo.triggered.connect(self.do_redo)
+
         self.act_toggle_theme = QAction("테마 전환", self)
         self.act_toggle_theme.setShortcut(QKeySequence("Ctrl+T"))
+        self.act_toggle_theme.setToolTip("테마 전환 (Ctrl+T)")
         self.act_toggle_theme.triggered.connect(self.toggle_theme)
 
         self.act_zoom_in = QAction("확대", self)
@@ -318,49 +370,58 @@ class MainWindow(QMainWindow):
         self.act_zoom_in.setShortcuts(
             [QKeySequence("Ctrl+="), QKeySequence("Ctrl++"), QKeySequence.StandardKey.ZoomIn]
         )
+        self.act_zoom_in.setToolTip("확대 (Ctrl+=)")
         self.act_zoom_in.triggered.connect(self.zoom_in)
 
         self.act_zoom_out = QAction("축소", self)
         self.act_zoom_out.setShortcuts(
             [QKeySequence("Ctrl+-"), QKeySequence.StandardKey.ZoomOut]
         )
+        self.act_zoom_out.setToolTip("축소 (Ctrl+-)")
         self.act_zoom_out.triggered.connect(self.zoom_out)
 
         self.act_zoom_reset = QAction("줌 초기화", self)
         self.act_zoom_reset.setShortcut(QKeySequence("Ctrl+0"))
+        self.act_zoom_reset.setToolTip("줌 초기화 (Ctrl+0)")
         self.act_zoom_reset.triggered.connect(self.zoom_reset)
 
         self.act_fullscreen = QAction("전체화면", self)
         self.act_fullscreen.setShortcut(QKeySequence("F11"))
         self.act_fullscreen.setCheckable(True)
+        self.act_fullscreen.setToolTip("전체화면 (F11)")
         self.act_fullscreen.triggered.connect(self.toggle_fullscreen)
 
         self.act_toggle_toc = QAction("목차 표시", self)
         self.act_toggle_toc.setShortcut(QKeySequence("Ctrl+\\"))
         self.act_toggle_toc.setCheckable(True)
         self.act_toggle_toc.setChecked(self.settings.toc_visible())
+        self.act_toggle_toc.setToolTip("목차 표시 (Ctrl+\\)")
         self.act_toggle_toc.triggered.connect(self.toggle_toc)
         self.toc_list.setVisible(self.settings.toc_visible())
 
-        # ---- 뷰 모드(상호배타 라디오, Ctrl+1/2/3) ----
+        # ---- 뷰 모드(상호배타 라디오, Ctrl+1/2/3/4) ----
         self.act_mode_editor = QAction("편집기", self)
         self.act_mode_editor.setShortcut(QKeySequence("Ctrl+1"))
         self.act_mode_editor.setCheckable(True)
+        self.act_mode_editor.setToolTip("편집기 전용 (Ctrl+1)")
         self.act_mode_editor.triggered.connect(self.set_mode_editor)
 
         self.act_mode_preview = QAction("미리보기", self)
         self.act_mode_preview.setShortcut(QKeySequence("Ctrl+2"))
         self.act_mode_preview.setCheckable(True)
+        self.act_mode_preview.setToolTip("미리보기 전용 (Ctrl+2)")
         self.act_mode_preview.triggered.connect(self.set_mode_preview)
 
         self.act_mode_split = QAction("분할(편집+미리보기)", self)
         self.act_mode_split.setShortcut(QKeySequence("Ctrl+3"))
         self.act_mode_split.setCheckable(True)
+        self.act_mode_split.setToolTip("분할 — 편집기+미리보기 (Ctrl+3)")
         self.act_mode_split.triggered.connect(self.set_mode_split)
 
         self.act_mode_wysiwyg = QAction("라이브 편집", self)
         self.act_mode_wysiwyg.setShortcut(QKeySequence("Ctrl+4"))
         self.act_mode_wysiwyg.setCheckable(True)
+        self.act_mode_wysiwyg.setToolTip("라이브 편집 — WYSIWYG (Ctrl+4)")
         self.act_mode_wysiwyg.triggered.connect(self.set_mode_wysiwyg)
 
         self._mode_group = QActionGroup(self)
@@ -383,6 +444,7 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
 
         m_file = mb.addMenu("파일(&F)")
+        m_file.addAction(self.act_new)
         m_file.addAction(self.act_open)
         self.menu_recent = m_file.addMenu("최근 파일(&R)")
         m_file.addSeparator()
@@ -393,6 +455,10 @@ class MainWindow(QMainWindow):
         m_file.addAction(self.act_reload)
         m_file.addSeparator()
         m_file.addAction(self.act_exit)
+
+        m_edit = mb.addMenu("편집(&E)")
+        m_edit.addAction(self.act_undo)
+        m_edit.addAction(self.act_redo)
 
         m_view = mb.addMenu("보기(&V)")
         m_view.addAction(self.act_mode_editor)
@@ -413,93 +479,204 @@ class MainWindow(QMainWindow):
         m_help.addAction(self.act_about)
 
     def _build_toolbar(self) -> None:
+        """워드프로세서식 단축 버튼 툴바(그룹+구분선+툴팁+표준아이콘).
+
+        [파일] 새 문서·열기·저장 | [편집] 실행취소·다시실행 |
+        [보기] 모드4종 · 줌3종 · 테마·목차.
+        다른이름저장/새로고침/붙여넣기는 툴바에서 제외(메뉴 유지).
+        """
         tb = self.addToolBar("메인")
         tb.setObjectName("mainToolbar")
         tb.setMovable(False)
+        # 아이콘 옆 텍스트(워드프로세서 느낌 — 한글 라벨 병기).
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+
+        # [파일] (다른이름저장은 메뉴 전용)
+        tb.addAction(self.act_new)
         tb.addAction(self.act_open)
-        tb.addAction(self.act_reload)
-        tb.addSeparator()
-        tb.addAction(self.act_paste)
         tb.addAction(self.act_save)
         tb.addSeparator()
+        # [편집]
+        tb.addAction(self.act_undo)
+        tb.addAction(self.act_redo)
+        tb.addSeparator()
+        # [보기] 모드 4종(QActionGroup 라디오)
         tb.addAction(self.act_mode_editor)
         tb.addAction(self.act_mode_preview)
         tb.addAction(self.act_mode_split)
         tb.addAction(self.act_mode_wysiwyg)
         tb.addSeparator()
+        # 줌
         tb.addAction(self.act_zoom_out)
         tb.addAction(self.act_zoom_reset)
         tb.addAction(self.act_zoom_in)
         tb.addSeparator()
+        # 테마/목차
         tb.addAction(self.act_toggle_theme)
         tb.addAction(self.act_toggle_toc)
 
     # ------------------------------------------------------------------ #
-    # 서식 툴바(WYSIWYG 전용) — execCommand 매핑(Phase 8)
+    # 서식 툴바(편집 surface 공통: Editor/Split=마크다운, WYSIWYG=execCommand)
     # ------------------------------------------------------------------ #
     def _build_format_toolbar(self) -> None:
-        """라이브 편집(WYSIWYG)용 서식 툴바. WYSIWYG 모드에서만 표시(§3.3).
+        """통합 서식 툴바(Phase 9). 편집 surface(Editor/Split/WYSIWYG)에서만 표시.
+
+        동일 QAction 이 활성 surface 에 따라 분기한다:
+            - Editor/Split → QTextCursor 마크다운 삽입/토글(`_editor_*`)
+            - WYSIWYG      → execCommand(`_wysiwyg_*`, 기존 동작 무변경)
 
         포맷 액션에는 단축키를 부여하지 않는다(전역 Ctrl+B 등 충돌·모드의존 복잡도
-        회피, v1 툴바 클릭 전용). 각 명령은 page().runJavaScript 로 실행.
+        회피, v1 툴바 클릭 전용). heading 은 QComboBox(본문/제목1~3).
         """
         tb = self.addToolBar("서식")
         tb.setObjectName("formatToolbar")
         tb.setMovable(False)
         self.format_toolbar = tb
 
-        self.act_fmt_bold = self._mk_fmt("굵게", lambda: self._exec_format("bold"))
-        self.act_fmt_italic = self._mk_fmt("기울임", lambda: self._exec_format("italic"))
-        self.act_fmt_strike = self._mk_fmt(
-            "취소선", lambda: self._exec_format("strikeThrough")
-        )
-        self.act_fmt_h1 = self._mk_fmt("H1", lambda: self._exec_format("formatBlock", "H1"))
-        self.act_fmt_h2 = self._mk_fmt("H2", lambda: self._exec_format("formatBlock", "H2"))
-        self.act_fmt_h3 = self._mk_fmt("H3", lambda: self._exec_format("formatBlock", "H3"))
-        self.act_fmt_p = self._mk_fmt("본문", lambda: self._exec_format("formatBlock", "P"))
-        self.act_fmt_ul = self._mk_fmt(
-            "• 목록", lambda: self._exec_format("insertUnorderedList")
-        )
-        self.act_fmt_ol = self._mk_fmt(
-            "1. 목록", lambda: self._exec_format("insertOrderedList")
-        )
-        self.act_fmt_quote = self._mk_fmt(
-            "인용", lambda: self._exec_format("formatBlock", "BLOCKQUOTE")
-        )
-        self.act_fmt_code = self._mk_fmt("코드", self._fmt_inline_code)
-        self.act_fmt_link = self._mk_fmt("링크", self._fmt_insert_link)
-        self.act_fmt_clear = self._mk_fmt("서식 지우기", self._fmt_clear)
+        # heading 드롭다운(본문=0, 제목1~3) — 에디터=#접두, WYSIWYG=formatBlock.
+        self.cmb_heading = QComboBox(self)
+        self.cmb_heading.addItems(["본문", "제목 1", "제목 2", "제목 3"])
+        self.cmb_heading.setToolTip("문단 스타일(본문/제목1~3)")
+        self.cmb_heading.activated.connect(self.fmt_heading)  # idx 0=본문,1~3=Hn
+        tb.addWidget(self.cmb_heading)
+        tb.addSeparator()
 
-        # 굵게/기울임/취소선 ─ H1/H2/H3/본문 ─ 목록 ─ 인용/코드/링크 ─ 서식지우기
+        # 인라인.
+        self.act_fmt_bold = self._mk_fmt("굵게", self.fmt_bold, "굵게 (**)")
+        self.act_fmt_italic = self._mk_fmt("기울임", self.fmt_italic, "기울임 (*)")
+        self.act_fmt_strike = self._mk_fmt("취소선", self.fmt_strike, "취소선 (~~)")
+        self.act_fmt_code = self._mk_fmt("코드", self.fmt_code, "인라인 코드 (`)")
         tb.addAction(self.act_fmt_bold)
         tb.addAction(self.act_fmt_italic)
         tb.addAction(self.act_fmt_strike)
+        tb.addAction(self.act_fmt_code)
         tb.addSeparator()
-        tb.addAction(self.act_fmt_h1)
-        tb.addAction(self.act_fmt_h2)
-        tb.addAction(self.act_fmt_h3)
-        tb.addAction(self.act_fmt_p)
-        tb.addSeparator()
+        # 블록.
+        self.act_fmt_ul = self._mk_fmt("• 목록", self.fmt_ul, "불릿 목록 (- )")
+        self.act_fmt_ol = self._mk_fmt("1. 목록", self.fmt_ol, "번호 목록 (1. )")
+        self.act_fmt_quote = self._mk_fmt("인용", self.fmt_quote, "인용 (> )")
         tb.addAction(self.act_fmt_ul)
         tb.addAction(self.act_fmt_ol)
-        tb.addSeparator()
         tb.addAction(self.act_fmt_quote)
-        tb.addAction(self.act_fmt_code)
-        tb.addAction(self.act_fmt_link)
         tb.addSeparator()
+        # 링크 / 서식 지우기.
+        self.act_fmt_link = self._mk_fmt("링크", self.fmt_link, "링크 삽입")
+        self.act_fmt_clear = self._mk_fmt(
+            "서식 지우기", self.fmt_clear, "서식 지우기(WYSIWYG 전용)"
+        )
+        tb.addAction(self.act_fmt_link)
         tb.addAction(self.act_fmt_clear)
 
-        tb.setVisible(False)  # _apply_view_mode 가 WYSIWYG 에서만 표시.
+        # B/I 강조(툴바 위젯에 스타일 — 외부 자산 0, ui-dev 재량).
+        try:
+            bw = tb.widgetForAction(self.act_fmt_bold)
+            if bw is not None:
+                bw.setStyleSheet("font-weight:bold;")
+            iw = tb.widgetForAction(self.act_fmt_italic)
+            if iw is not None:
+                iw.setStyleSheet("font-style:italic;")
+        except Exception:
+            pass
 
-    def _mk_fmt(self, label: str, slot) -> QAction:
+        tb.setVisible(False)  # _apply_view_mode 가 편집 surface 에서만 표시.
+
+    def _mk_fmt(self, label: str, slot, tip: str = "") -> QAction:
         a = QAction(label, self)
+        if tip:
+            a.setToolTip(tip)
         a.triggered.connect(slot)
         return a
 
+    # ---- surface 판별 헬퍼(서식/undo-redo 공유) ---------------------------
+    def _is_source_editor_surface(self) -> bool:
+        """활성 편집 대상이 소스 편집기인가(Editor/Split)."""
+        return self._view_mode in (MODE_EDITOR, MODE_SPLIT)
+
+    def _is_wysiwyg_surface(self) -> bool:
+        """활성 편집 대상이 WYSIWYG webview 인가."""
+        return self._view_mode == MODE_WYSIWYG and self._wysiwyg_active
+
+    def _is_edit_surface(self) -> bool:
+        """편집 가능한 surface 가 활성인가(Editor/Split/WYSIWYG)."""
+        return self._is_source_editor_surface() or self._view_mode == MODE_WYSIWYG
+
+    # ---- 의미 단위 서식 슬롯(툴바 액션이 연결) — surface 분기 진입 ---------
+    def fmt_bold(self) -> None:
+        self._dispatch_inline("bold")
+
+    def fmt_italic(self) -> None:
+        self._dispatch_inline("italic")
+
+    def fmt_strike(self) -> None:
+        self._dispatch_inline("strike")
+
+    def fmt_code(self) -> None:
+        self._dispatch_inline("code")
+
+    def fmt_ul(self) -> None:
+        self._dispatch_block("ul")
+
+    def fmt_ol(self) -> None:
+        self._dispatch_block("ol")
+
+    def fmt_quote(self) -> None:
+        self._dispatch_block("quote")
+
+    def fmt_link(self) -> None:
+        self._dispatch_link()
+
+    def fmt_clear(self) -> None:
+        self._dispatch_clear()
+
+    def fmt_heading(self, level: int) -> None:
+        """heading 콤보 선택(0=본문, 1~3=제목). idx 가 그대로 level."""
+        self._dispatch_heading(int(level))
+
+    # ---- 디스패처: 활성 surface 로 분기 ----------------------------------
+    def _dispatch_inline(self, kind: str) -> None:
+        if self._is_wysiwyg_surface():
+            self._wysiwyg_inline(kind)
+        elif self._is_source_editor_surface():
+            self._editor_inline(kind)
+        # Preview 전용 → no-op(툴바 숨김, 방어적).
+
+    def _dispatch_block(self, kind: str) -> None:
+        if self._is_wysiwyg_surface():
+            self._wysiwyg_block(kind)
+        elif self._is_source_editor_surface():
+            self._editor_block(kind)
+
+    def _dispatch_heading(self, level: int) -> None:
+        if self._is_wysiwyg_surface():
+            self._wysiwyg_heading(level)
+        elif self._is_source_editor_surface():
+            self._editor_heading(level)
+
+    def _dispatch_link(self) -> None:
+        if not self._is_edit_surface():
+            return
+        url, ok = QInputDialog.getText(self, "링크 삽입", "URL:")
+        if not ok or not url.strip():
+            return
+        url = url.strip()
+        if self._is_wysiwyg_surface():
+            self._exec_format("createLink", url)  # 기존 execCommand 경로
+        elif self._is_source_editor_surface():
+            self._editor_link(url)
+
+    def _dispatch_clear(self) -> None:
+        if self._is_wysiwyg_surface():
+            self._wysiwyg_clear()  # removeFormat + formatBlock P(기존)
+        elif self._is_source_editor_surface():
+            self._editor_clear()  # v1: 안내(설계 §5.5 — 게이팅으로 보통 비활성)
+
+    # ------------------------------------------------------------------ #
+    # (a) WYSIWYG 경로 — 기존 execCommand 동작(래퍼만, 동작 무변경)
+    # ------------------------------------------------------------------ #
     def _exec_format(self, command: str, value: str | None = None) -> None:
         """WYSIWYG 편집 루트에 execCommand 적용 후 즉시 1회 캡처(폴링 보조).
 
-        WYSIWYG 모드가 아니면 no-op(툴바는 모드에서만 표시되나 방어적).
+        WYSIWYG 활성이 아니면 no-op(디스패치가 게이트하나 방어적).
         """
         if not self._wysiwyg_active:
             return
@@ -515,7 +692,26 @@ class MainWindow(QMainWindow):
         # 늦으면 다음 폴링 tick 이 백업한다(best-effort).
         self._capture_wysiwyg_once(final=False)
 
-    def _fmt_inline_code(self) -> None:
+    def _wysiwyg_inline(self, kind: str) -> None:
+        cmd = {"bold": "bold", "italic": "italic", "strike": "strikeThrough"}.get(kind)
+        if cmd:
+            self._exec_format(cmd)
+        elif kind == "code":
+            self._wysiwyg_inline_code()
+
+    def _wysiwyg_block(self, kind: str) -> None:
+        if kind == "ul":
+            self._exec_format("insertUnorderedList")
+        elif kind == "ol":
+            self._exec_format("insertOrderedList")
+        elif kind == "quote":
+            self._exec_format("formatBlock", "BLOCKQUOTE")
+
+    def _wysiwyg_heading(self, level: int) -> None:
+        tag = {0: "P", 1: "H1", 2: "H2", 3: "H3"}.get(level, "P")
+        self._exec_format("formatBlock", tag)
+
+    def _wysiwyg_inline_code(self) -> None:
         """선택 영역을 <code> 로 감싼다(execCommand 미지원 → 커스텀 JS).
 
         선택이 없으면 no-op(빈 코드 삽입 방지). html_to_markdown 이 <code>→`code`
@@ -539,22 +735,189 @@ class MainWindow(QMainWindow):
             pass
         self._capture_wysiwyg_once(final=False)
 
-    def _fmt_insert_link(self) -> None:
-        """URL 을 Qt 입력 다이얼로그로 받아 선택 영역을 링크로(createLink)."""
-        if not self._wysiwyg_active:
-            return
-        url, ok = QInputDialog.getText(self, "링크 삽입", "URL:")
-        if not ok or not url.strip():
-            return
-        # createLink 는 현재 선택을 링크로. 선택이 없으면 일부 Chromium 에서 no-op(v1 수용).
-        self._exec_format("createLink", url.strip())
-
-    def _fmt_clear(self) -> None:
-        """인라인 서식 제거 + 블록을 본문(P)으로 환원."""
+    def _wysiwyg_clear(self) -> None:
+        """인라인 서식 제거 + 블록을 본문(P)으로 환원(WYSIWYG 전용)."""
         if not self._wysiwyg_active:
             return
         self._exec_format("removeFormat")
         self._exec_format("formatBlock", "P")
+
+    # ------------------------------------------------------------------ #
+    # (b) 에디터(QTextCursor) 경로 — 마크다운 마커 삽입/토글
+    # ------------------------------------------------------------------ #
+    def _editor_inline(self, kind: str) -> None:
+        """선택을 마크다운 인라인 마커로 토글(없으면 빈 쌍 + 커서 가운데).
+
+        QPlainTextEdit 선택은 단락 구분자로 U+2029 를 쓰므로 \\n 으로 환원한다.
+        insertText 가 textChanged 를 발화 → dirty+디바운스 렌더 자동(별도 호출 불필요).
+        """
+        mark = _INLINE_MARK.get(kind)
+        if mark is None:
+            return
+        cur = self.editor.textCursor()
+        sel = cur.selectedText()
+        if sel:
+            text = sel.replace(" ", "\n")
+            if (
+                text.startswith(mark)
+                and text.endswith(mark)
+                and len(text) >= 2 * len(mark)
+            ):
+                new = text[len(mark): len(text) - len(mark)]  # 토글 해제
+            else:
+                new = f"{mark}{text}{mark}"  # 토글 적용
+            cur.insertText(new)  # 선택 치환(undo 1스텝)
+        else:
+            cur.insertText(mark + mark)  # 빈 마커 쌍
+            pos = cur.position() - len(mark)  # 가운데로 커서 이동
+            cur.setPosition(pos)
+            self.editor.setTextCursor(cur)
+        self.editor.setFocus()
+
+    def _editor_block(self, kind: str) -> None:
+        """불릿/번호/인용: 선택된 각 줄 머리에 접두 토글."""
+        prefix = _LINE_PREFIX.get(kind)
+        if prefix is None:
+            return
+        self._editor_apply_line_prefix(prefix, exclusive=False)
+
+    def _editor_heading(self, level: int) -> None:
+        """제목1~3 = 줄 머리에 #/##/### (기존 헤딩 접두 교체). 0 = 본문(# 제거)."""
+        if level == 0:
+            self._editor_strip_heading()
+        else:
+            prefix = _HEADING_PREFIX.get(level)
+            if prefix is None:
+                return
+            self._editor_apply_line_prefix(prefix, exclusive=True, is_heading=True)
+
+    def _editor_apply_line_prefix(
+        self, prefix: str, *, exclusive: bool, is_heading: bool = False
+    ) -> None:
+        """선택(또는 현재 줄)의 각 줄 머리에 prefix 를 토글한다(undo 1스텝).
+
+        is_heading=True: 기존 헤딩 접두(#,##,###)를 먼저 제거 후 새 접두 부여
+            (첫 줄이 이미 동일 접두면 제거 = 토글). 목록/인용(exclusive=False)은 단순 토글.
+        번호 목록('1. ')은 v1 에서 모든 줄에 부여(마크다운 렌더러가 순번화).
+        """
+        doc = self.editor.document()
+        cur = self.editor.textCursor()
+        cur.beginEditBlock()
+        try:
+            start_block = doc.findBlock(cur.selectionStart()).blockNumber()
+            end_block = doc.findBlock(cur.selectionEnd()).blockNumber()
+            # 토글 판단: 선택 첫 줄이 이미 prefix 면 제거 모드.
+            first_text = doc.findBlockByNumber(start_block).text()
+            remove = first_text.startswith(prefix)
+            for n in range(start_block, end_block + 1):
+                blk = doc.findBlockByNumber(n)
+                line = blk.text()
+                edit = QTextCursor(blk)
+                edit.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+                if is_heading:
+                    m = _HEADING_RE.match(line)
+                    if m:
+                        edit.movePosition(
+                            QTextCursor.MoveOperation.Right,
+                            QTextCursor.MoveMode.KeepAnchor,
+                            len(m.group(1)),
+                        )
+                        edit.removeSelectedText()
+                    if not remove:
+                        edit.insertText(prefix)  # 새 헤딩 레벨
+                else:
+                    if remove and line.startswith(prefix):
+                        edit.movePosition(
+                            QTextCursor.MoveOperation.Right,
+                            QTextCursor.MoveMode.KeepAnchor,
+                            len(prefix),
+                        )
+                        edit.removeSelectedText()
+                    elif not remove and not line.startswith(prefix):
+                        edit.insertText(prefix)
+        finally:
+            cur.endEditBlock()
+        self.editor.setFocus()
+
+    def _editor_strip_heading(self) -> None:
+        """현재 줄/선택의 헤딩 접두(#,##,…)를 제거(본문 전환)."""
+        doc = self.editor.document()
+        cur = self.editor.textCursor()
+        cur.beginEditBlock()
+        try:
+            start_block = doc.findBlock(cur.selectionStart()).blockNumber()
+            end_block = doc.findBlock(cur.selectionEnd()).blockNumber()
+            for n in range(start_block, end_block + 1):
+                blk = doc.findBlockByNumber(n)
+                m = _HEADING_RE.match(blk.text())
+                if m:
+                    edit = QTextCursor(blk)
+                    edit.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+                    edit.movePosition(
+                        QTextCursor.MoveOperation.Right,
+                        QTextCursor.MoveMode.KeepAnchor,
+                        len(m.group(1)),
+                    )
+                    edit.removeSelectedText()
+        finally:
+            cur.endEditBlock()
+        self.editor.setFocus()
+
+    def _editor_link(self, url: str) -> None:
+        """[선택텍스트](url) 삽입. 선택이 없으면 [링크 텍스트](url) + placeholder 선택."""
+        cur = self.editor.textCursor()
+        sel = cur.selectedText().replace(" ", "\n")
+        if sel:
+            cur.insertText(f"[{sel}]({url})")
+        else:
+            placeholder = "링크 텍스트"
+            cur.insertText(f"[{placeholder}]({url})")
+            # 커서를 placeholder 선택 상태로(바로 덮어쓰기 가능): "]({url})" 길이만큼 보정.
+            tail = len(url) + 3  # ']' '(' ... ')' → "](" + ")" = 3
+            pos = cur.position() - (tail + len(placeholder))
+            cur.setPosition(pos)
+            cur.setPosition(pos + len(placeholder), QTextCursor.MoveMode.KeepAnchor)
+            self.editor.setTextCursor(cur)
+        self.editor.setFocus()
+
+    def _editor_clear(self) -> None:
+        """에디터 서식 지우기 — v1: 안내(소스에서 마커 자동 제거는 모호).
+
+        보통 _apply_view_mode 가 에디터 surface 에서 act_fmt_clear 를 비활성화하므로
+        도달이 드물다(방어적 안내).
+        """
+        self.statusBar().showMessage(
+            "서식 지우기는 라이브 편집(WYSIWYG)에서 동작합니다.", 3000
+        )
+
+    # ------------------------------------------------------------------ #
+    # Undo / Redo — 활성 surface 라우팅(Editor/Split=editor, WYSIWYG=execCommand)
+    # ------------------------------------------------------------------ #
+    def do_undo(self) -> None:
+        """활성 편집 surface 로 undo 라우팅(Preview 전용이면 no-op)."""
+        if self._is_wysiwyg_surface():
+            self._wysiwyg_exec_simple("undo")
+        elif self._is_source_editor_surface():
+            self.editor.undo()
+        # Preview 전용 → no-op(액션 자체가 _apply_view_mode 에서 비활성).
+
+    def do_redo(self) -> None:
+        if self._is_wysiwyg_surface():
+            self._wysiwyg_exec_simple("redo")
+        elif self._is_source_editor_surface():
+            self.editor.redo()
+
+    def _wysiwyg_exec_simple(self, command: str) -> None:
+        """WYSIWYG 에서 execCommand 실행 후 즉시 캡처(undo/redo 공용)."""
+        if not self._wysiwyg_active:
+            return
+        try:
+            self.view.page().runJavaScript(
+                "document.execCommand(%r,false,null);" % command
+            )
+        except Exception:
+            pass
+        self._capture_wysiwyg_once(final=False)  # _doc_text 동기화(폴링 보조)
 
     # ------------------------------------------------------------------ #
     # 최근 파일 메뉴
@@ -691,6 +1054,42 @@ class MainWindow(QMainWindow):
         self._set_dirty(True)
         self.statusBar().showMessage("임시 문서(붙여넣기) — 저장하려면 Ctrl+S", 5000)
 
+    def new_document(self) -> None:
+        """Ctrl+N: 빈 임시(scratch) 문서로 교체한다(미저장 가드 후).
+
+        빈 새 문서는 dirty=False(아직 변경 없음). 편집 불가 모드(Preview)면 Split 로
+        전환해 즉시 타이핑할 수 있게 하고 편집기에 포커스한다.
+        """
+        if not self._maybe_discard():
+            return  # 사용자 취소 → 중단(데이터 보호)
+        # 문서 교체 → WYSIWYG 라이브 편집을 빠져나온다(새 문서는 일반 렌더, §4.6 정합).
+        self._leave_wysiwyg_for_document_change()
+        self._clear_external_change_banner()
+        self._new_scratch()
+        # 편집 가능 모드 보장: Preview 전용이면 Split 로(편집기+프리뷰).
+        if self._view_mode == MODE_PREVIEW:
+            self._apply_view_mode(MODE_SPLIT)  # 내부에서 _sync_editor_from_doc 호출
+        self.editor.setFocus()
+        self.statusBar().showMessage("새 문서 — 입력 후 Ctrl+S 로 저장", 4000)
+
+    def _new_scratch(self) -> None:
+        """현재 문서를 '빈' scratch(미저장 임시 문서)로 전환(dirty=False).
+
+        _set_scratch(paste, dirty=True)와 달리 빈 새 문서는 깨끗하다. watch 중지
+        (디스크 파일 없음) → _path=None → _doc_text="" → 빈 렌더 → 편집기 비움.
+        """
+        if self._watcher is not None:
+            try:
+                self._watcher.stop()  # watch 생명주기: scratch=stop
+            except Exception:
+                pass
+        self._path = None
+        self._doc_text = ""
+        self._pending_scroll = None
+        self._render_doc(preserve_scroll=False)  # 빈 본문 렌더(프리뷰 비움)
+        self._sync_editor_from_doc()  # 편집기 비움(신호 억제)
+        self._set_dirty(False)  # ★ 빈 새 문서는 깨끗(타이틀 "제목 없음")
+
     def _attach_path(self, path: Path) -> None:
         """문서를 디스크 파일에 연결(열기/저장 성공 후).
 
@@ -738,7 +1137,9 @@ class MainWindow(QMainWindow):
 
         show_editor = mode in (MODE_EDITOR, MODE_SPLIT)
         show_preview = mode in (MODE_PREVIEW, MODE_SPLIT, MODE_WYSIWYG)
-        show_format_toolbar = mode == MODE_WYSIWYG
+        # ★ 서식 툴바: 편집 surface 공통(Editor/Split/WYSIWYG)에서 표시(Phase 9).
+        edit_surface = mode in (MODE_EDITOR, MODE_SPLIT, MODE_WYSIWYG)
+        show_format_toolbar = edit_surface
 
         # EDITOR/SPLIT 진입 시 편집기를 _doc_text 와 동기화(신호 억제로 dirty 오염 방지).
         if show_editor:
@@ -748,8 +1149,13 @@ class MainWindow(QMainWindow):
         self.editor.setVisible(show_editor)
         self.view.setVisible(show_preview)
 
-        # 서식 툴바: WYSIWYG 에서만 표시.
+        # 서식 툴바: 편집 surface 에서 표시(Preview 전용 숨김).
         self.format_toolbar.setVisible(show_format_toolbar)
+        # Undo/Redo: 편집 surface 에서만 활성(Preview 전용 비활성).
+        self.act_undo.setEnabled(edit_surface)
+        self.act_redo.setEnabled(edit_surface)
+        # 서식 지우기: 에디터 surface 에선 모호 → WYSIWYG 에서만 활성(설계 §5.5 권장).
+        self.act_fmt_clear.setEnabled(mode == MODE_WYSIWYG)
 
         # TOC: 프리뷰류(WYSIWYG 포함)가 보일 때만 의미. 사용자 토글값 게이팅(덮지 않음).
         toc_allowed = show_preview
@@ -1471,13 +1877,16 @@ class MainWindow(QMainWindow):
             "<p>만든이 : One &amp; Wise for YONI</p>"
             f"<p style='color:gray;font-size:0.9em'>코어 엔진: {core}</p>"
             "<p style='color:gray;font-size:0.85em'>"
-            "단축키: Ctrl+O 열기 · Ctrl+Shift+V 붙여넣기 · "
+            "단축키: Ctrl+N 새 문서 · Ctrl+O 열기 · Ctrl+Shift+V 붙여넣기 · "
             "Ctrl+S 저장 · Ctrl+Shift+S 다른 이름으로 저장 · "
+            "Ctrl+Z 실행취소 · Ctrl+Shift+Z / Ctrl+Y 다시실행 · "
             "Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+4 편집기 / 미리보기 / 분할 / 라이브 편집 · "
             "Ctrl+R 새로고침 · Ctrl+T 테마 · "
             "Ctrl+= / Ctrl+- / Ctrl+0 줌 · F11 전체화면 · Ctrl+\\ 목차</p>"
             "<p style='color:gray;font-size:0.82em'>"
-            "라이브 편집(WYSIWYG): 미리보기에서 직접 서식을 적용하며 편집합니다. "
+            "서식 툴바: 편집기/분할/라이브 편집에서 표시됩니다. 편집기/분할에선 "
+            "마크다운 마커(**, *, ~~, `, 목록/인용/제목)를 삽입하고, "
+            "라이브 편집(WYSIWYG)에선 미리보기에서 직접 서식을 적용합니다. "
             "마크다운 소스가 정규화될 수 있습니다(내용은 보존).</p>",
         )
 
